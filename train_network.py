@@ -120,6 +120,77 @@ class NetworkTrainer:
                     )
 
         return logs
+    
+    @staticmethod
+    def _rms_to_2d_weight(tensor: torch.Tensor, role: str) -> torch.Tensor:
+        t = tensor.detach().float()
+
+        if t.ndim == 2:
+            return t
+
+        if t.ndim >= 3:
+            return t.reshape(t.shape[0], -1)
+
+        if t.ndim == 1:
+            return t.reshape(1, -1) if role == "down" else t.reshape(-1, 1)
+
+        raise ValueError(f"Unsupported tensor rank for RMS check: {t.ndim}")
+
+
+    @staticmethod
+    def _rms_product_frobenius_norm(left: torch.Tensor, right: torch.Tensor) -> float:
+        if left.shape[1] != right.shape[0]:
+            raise ValueError(f"product shape mismatch: left={tuple(left.shape)}, right={tuple(right.shape)}")
+
+        gram_l = left.T @ left
+        gram_r = right @ right.T
+        fro_sq = torch.sum(gram_l * gram_r).clamp_min(0.0)
+        return float(torch.sqrt(fro_sq).item())
+
+
+    @staticmethod
+    @torch.no_grad()
+    def compute_total_scaled_lora_rms(network) -> float:
+        total_numel = 0
+        total_fro_sq = 0.0
+
+        for module in network.modules():
+            if not hasattr(module, "lora_down") or not hasattr(module, "lora_up"):
+                continue
+
+            if not hasattr(module.lora_down, "weight") or not hasattr(module.lora_up, "weight"):
+                continue
+
+            down = NetworkTrainer._rms_to_2d_weight(module.lora_down.weight, role="down")
+            up = NetworkTrainer._rms_to_2d_weight(module.lora_up.weight, role="up")
+
+            if up.shape[1] != down.shape[0]:
+                continue
+
+            rank = int(down.shape[0])
+
+            alpha = getattr(module, "alpha", None)
+            if alpha is None:
+                scale = 1.0
+            else:
+                if isinstance(alpha, torch.Tensor):
+                    alpha = float(alpha.detach().float().reshape(-1)[0].item())
+                else:
+                    alpha = float(alpha)
+
+                scale = alpha / rank if rank > 0 else 1.0
+
+            raw_fro = NetworkTrainer._rms_product_frobenius_norm(up, down)
+            scaled_fro = raw_fro * scale
+
+            effective_numel = int(up.shape[0] * down.shape[1])
+            total_numel += effective_numel
+            total_fro_sq += scaled_fro * scaled_fro
+
+        if total_numel <= 0:
+            return 0.0
+
+        return math.sqrt(total_fro_sq) / math.sqrt(total_numel)
 
     def assert_extra_args(self, args, train_dataset_group):
         train_dataset_group.verify_bucket_reso_steps(64)
@@ -835,6 +906,8 @@ class NetworkTrainer:
             "ss_huber_c": args.huber_c,
             "ss_fp8_base": bool(args.fp8_base),
             "ss_fp8_base_unet": bool(args.fp8_base_unet),
+            "ss_target_total_rms": args.target_total_rms,
+            "ss_total_rms_check_every_n_steps": args.total_rms_check_every_n_steps,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1131,6 +1204,9 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
+        stop_due_to_total_rms = False
+        last_total_rms = None
+
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -1266,11 +1342,30 @@ class NetworkTrainer:
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
                     keys_scaled, mean_norm, maximum_norm = None, None, None
+                    max_mean_logs = {}
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+
+                    if (
+                        args.target_total_rms is not None
+                        and args.total_rms_check_every_n_steps > 0
+                        and global_step % args.total_rms_check_every_n_steps == 0
+                    ):
+                        total_rms = self.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
+                        last_total_rms = total_rms
+
+                        accelerator.print(
+                            f"total_rms={total_rms:.8g}, target_total_rms={args.target_total_rms:.8g}"
+                        )
+
+                        if total_rms >= args.target_total_rms:
+                            accelerator.print(
+                                f"target_total_rms reached: {total_rms:.8g} >= {args.target_total_rms:.8g}"
+                            )
+                            stop_due_to_total_rms = True
 
                     optimizer_eval_fn()
                     self.sample_images(
@@ -1296,8 +1391,13 @@ class NetworkTrainer:
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
+                logs = {"avr_loss": avr_loss}
+                # , "lr": lr_scheduler.get_last_lr()[0]}
+
+                if last_total_rms is not None:
+                    logs["total_rms"] = last_total_rms
+
+                progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if args.scale_weight_norms:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
@@ -1306,9 +1406,11 @@ class NetworkTrainer:
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
                     )
+                    if last_total_rms is not None:
+                        logs["strength/total_rms"] = last_total_rms
                     accelerator.log(logs, step=global_step)
 
-                if global_step >= args.max_train_steps:
+                if global_step >= args.max_train_steps or stop_due_to_total_rms:
                     break
 
             if len(accelerator.trackers) > 0:
@@ -1337,6 +1439,8 @@ class NetworkTrainer:
             optimizer_train_fn()
 
             # end of epoch
+            if stop_due_to_total_rms:
+                break
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
@@ -1369,6 +1473,20 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
+
+    parser.add_argument(
+        "--target_total_rms",
+        type=float,
+        default=None,
+        help="stop training when total scaled adapter RMS reaches this value",
+    )
+
+    parser.add_argument(
+        "--total_rms_check_every_n_steps",
+        type=int,
+        default=25,
+        help="check total scaled adapter RMS every N optimizer steps",
+    )
 
     parser.add_argument(
         "--cpu_offload_checkpointing",
