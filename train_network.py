@@ -1,5 +1,6 @@
 import importlib
 import argparse
+import csv
 import math
 import os
 import sys
@@ -7,7 +8,7 @@ import random
 import time
 import json
 from multiprocessing import Value
-from typing import Any, List
+from typing import Any, Dict, List, Optional
 import toml
 
 from tqdm import tqdm
@@ -46,6 +47,197 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class WeightValueTracker:
+    CSV_FIELDS = [
+        "step",
+        "epoch",
+        "track_id",
+        "source",
+        "param_kind",
+        "layer",
+        "param_name",
+        "shape",
+        "flat_index",
+        "value",
+    ]
+
+    def __init__(self, args: argparse.Namespace, accelerator: Accelerator, network: torch.nn.Module):
+        self.enabled = bool(args.track_weight_values)
+        self.interval = args.weight_track_interval
+        self.csv_file = None
+        self.writer = None
+        self.csv_path: Optional[str] = None
+        self.tracked_weights: List[Dict[str, Any]] = []
+
+        if not self.enabled:
+            return
+
+        if args.weight_track_count <= 0:
+            raise ValueError("weight_track_count must be greater than 0")
+        if args.weight_track_interval <= 0:
+            raise ValueError("weight_track_interval must be greater than 0")
+
+        if not accelerator.is_main_process:
+            self.enabled = False
+            return
+
+        log_dir = self.get_log_dir(accelerator)
+        if log_dir is None:
+            raise ValueError("--track_weight_values requires --logging_dir so the CSV can be written beside training logs")
+
+        self.tracked_weights = self.sample_weights(network, args.weight_track_count, args.weight_track_seed)
+        if len(self.tracked_weights) == 0:
+            raise ValueError("no trainable weight parameters were found for --track_weight_values")
+
+        os.makedirs(log_dir, exist_ok=True)
+        self.csv_path = os.path.join(log_dir, "tracked_weight_values.csv")
+        self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.csv_file, fieldnames=self.CSV_FIELDS)
+        self.writer.writeheader()
+        self.csv_file.flush()
+
+        source_counts: Dict[str, int] = {}
+        for item in self.tracked_weights:
+            source_counts[item["source"]] = source_counts.get(item["source"], 0) + 1
+        logger.info(f"tracking {len(self.tracked_weights)} weight values in {self.csv_path}: {source_counts}")
+
+    @staticmethod
+    def get_log_dir(accelerator: Accelerator) -> Optional[str]:
+        logging_dir = getattr(accelerator, "logging_dir", None) or getattr(accelerator, "project_dir", None)
+        if logging_dir is None:
+            return None
+        return os.fspath(logging_dir)
+
+    @staticmethod
+    def classify_source(name: str) -> str:
+        if "lora_te1" in name:
+            return "text_encoder_1"
+        if "lora_te2" in name:
+            return "text_encoder_2"
+        if "lora_te3" in name:
+            return "text_encoder_3"
+        if "lora_te" in name:
+            return "text_encoder"
+        if "lora_unet" in name:
+            return "unet"
+        return "other"
+
+    @staticmethod
+    def classify_param_kind(name: str) -> str:
+        if "lora_down" in name:
+            return "lora_down"
+        if "lora_up" in name:
+            return "lora_up"
+        return "weight"
+
+    @staticmethod
+    def get_layer_name(name: str) -> str:
+        for token in [".lora_down.", ".lora_up."]:
+            if token in name:
+                return name.split(token, 1)[0]
+        return name.rsplit(".", 1)[0]
+
+    @staticmethod
+    def source_sort_key(source: str) -> tuple:
+        if source.startswith("text_encoder"):
+            return (0, source)
+        if source == "unet":
+            return (1, source)
+        return (2, source)
+
+    @staticmethod
+    def order_candidates_by_layer(candidates: List[Dict[str, Any]], rng: random.Random) -> List[Dict[str, Any]]:
+        layer_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for candidate in candidates:
+            layer_groups.setdefault(candidate["layer"], []).append(candidate)
+
+        for layer_candidates in layer_groups.values():
+            rng.shuffle(layer_candidates)
+
+        layers = list(layer_groups.keys())
+        rng.shuffle(layers)
+
+        ordered: List[Dict[str, Any]] = []
+        while any(layer_groups[layer] for layer in layers):
+            for layer in layers:
+                if layer_groups[layer]:
+                    ordered.append(layer_groups[layer].pop(0))
+
+        return ordered
+
+    @classmethod
+    def sample_weights(cls, network: torch.nn.Module, count: int, seed: int) -> List[Dict[str, Any]]:
+        rng = random.Random(seed)
+        grouped_candidates: Dict[str, List[Dict[str, Any]]] = {}
+        all_candidates: List[Dict[str, Any]] = []
+
+        for name, param in network.named_parameters():
+            if not param.requires_grad or param.numel() == 0 or not name.endswith(".weight"):
+                continue
+
+            source = cls.classify_source(name)
+            candidate = {
+                "param": param,
+                "param_name": name,
+                "source": source,
+                "param_kind": cls.classify_param_kind(name),
+                "layer": cls.get_layer_name(name),
+                "shape": "x".join(str(dim) for dim in param.shape),
+            }
+            grouped_candidates.setdefault(source, []).append(candidate)
+            all_candidates.append(candidate)
+
+        for source, candidates in list(grouped_candidates.items()):
+            grouped_candidates[source] = cls.order_candidates_by_layer(candidates, rng)
+
+        selected: List[Dict[str, Any]] = []
+        source_names = sorted(grouped_candidates.keys(), key=cls.source_sort_key)
+        while len(selected) < count and any(grouped_candidates[source] for source in source_names):
+            for source in source_names:
+                if grouped_candidates[source]:
+                    selected.append(grouped_candidates[source].pop(0))
+                    if len(selected) >= count:
+                        break
+
+        while len(selected) < count and all_candidates:
+            selected.append(rng.choice(all_candidates).copy())
+
+        for track_id, item in enumerate(selected):
+            item["track_id"] = track_id
+            item["flat_index"] = rng.randrange(item["param"].numel())
+
+        return selected
+
+    def record(self, step: int, epoch: int):
+        if not self.enabled or self.writer is None:
+            return
+        if step != 0 and step % self.interval != 0:
+            return
+
+        for item in self.tracked_weights:
+            value = item["param"].detach().flatten()[item["flat_index"]].float().cpu().item()
+            self.writer.writerow(
+                {
+                    "step": step,
+                    "epoch": epoch,
+                    "track_id": item["track_id"],
+                    "source": item["source"],
+                    "param_kind": item["param_kind"],
+                    "layer": item["layer"],
+                    "param_name": item["param_name"],
+                    "shape": item["shape"],
+                    "flat_index": item["flat_index"],
+                    "value": f"{value:.17g}",
+                }
+            )
+        self.csv_file.flush()
+
+    def close(self):
+        if self.csv_file is not None:
+            self.csv_file.close()
+            self.csv_file = None
 
 
 class NetworkTrainer:
@@ -1121,6 +1313,8 @@ class NetworkTrainer:
                 initial_step = 0  # do not skip
 
         global_step = 0
+        weight_value_tracker = WeightValueTracker(args, accelerator, accelerator.unwrap_model(network))
+        weight_value_tracker.record(global_step, current_epoch.value)
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1348,6 +1542,7 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    weight_value_tracker.record(global_step, current_epoch.value)
 
                     if (
                         args.target_total_rms is not None
@@ -1460,6 +1655,8 @@ class NetworkTrainer:
 
             logger.info("model saved.")
 
+        weight_value_tracker.close()
+
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -1486,6 +1683,33 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=25,
         help="check total scaled adapter RMS every N optimizer steps",
+    )
+
+    parser.add_argument(
+        "--track_weight_values",
+        action="store_true",
+        help="track a random sample of trainable weight values to a CSV file in the logging directory",
+    )
+
+    parser.add_argument(
+        "--weight_track_count",
+        type=int,
+        default=32,
+        help="number of trainable weight values to track when --track_weight_values is enabled",
+    )
+
+    parser.add_argument(
+        "--weight_track_interval",
+        type=int,
+        default=1,
+        help="record tracked weight values every N optimizer steps",
+    )
+
+    parser.add_argument(
+        "--weight_track_seed",
+        type=int,
+        default=0,
+        help="random seed used to choose which trainable weight values are tracked",
     )
 
     parser.add_argument(
