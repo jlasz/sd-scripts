@@ -32,6 +32,7 @@ from library import (
     strategy_base,
     strategy_sd,
     strategy_sdxl,
+    sai_model_spec,
 )
 
 import library.model_util as model_util
@@ -123,7 +124,7 @@ def train(args):
         }
 
     blueprint = blueprint_generator.generate(user_config, args)
-    train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -133,6 +134,7 @@ def train(args):
     train_dataset_group.verify_bucket_reso_steps(32)
 
     if args.debug_dataset:
+        train_dataset_group.set_current_strategies()  # dataset needs to know the strategies explicitly
         train_util.debug_dataset(train_dataset_group)
         return
     if len(train_dataset_group) == 0:
@@ -589,6 +591,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, False, True, True)
     train_util.add_training_arguments(parser, False)
     deepspeed_utils.add_deepspeed_arguments(parser)

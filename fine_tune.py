@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 import library.train_util as train_util
 import library.config_util as config_util
+import library.sai_model_spec as sai_model_spec
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -91,9 +92,10 @@ def train(args):
             }
 
         blueprint = blueprint_generator.generate(user_config, args)
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
         train_dataset_group = train_util.load_arbitrary_dataset(args)
+        val_dataset_group = None
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -361,6 +363,17 @@ def train(args):
                         # latentに変換
                         latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(weight_dtype)
                     latents = latents * 0.18215
+                    
+                    if batch["masks"] is not None:
+                        masked_latents = vae.encode(
+                            batch["masked_images"].to(dtype=vae_dtype)
+                        ).latent_dist.sample().to(weight_dtype)
+                        masked_latents = masked_latents * 0.18215
+                        # Resize the mask to latents shape as we concatenate the mask to the latents
+                        mask = torch.nn.functional.interpolate(
+                            batch["masks"].to(weight_dtype), size=latents.shape[2:]
+                        )
+
                 b_size = latents.shape[0]
 
                 with torch.set_grad_enabled(args.train_text_encoder):
@@ -382,6 +395,10 @@ def train(args):
                 # with noise offset and/or multires noise if specified
                 noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
 
+                if batch["masks"] is not None:
+                    # Concatenate the noised latents with the mask and the masked latents
+                    noisy_latents = torch.cat([noisy_latents, mask, masked_latents], dim=1)
+ 
                 # Predict the noise residual
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -518,6 +535,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, False, True, True)
     train_util.add_training_arguments(parser, False)
     deepspeed_utils.add_deepspeed_arguments(parser)

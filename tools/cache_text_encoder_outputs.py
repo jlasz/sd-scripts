@@ -22,6 +22,7 @@ from library import (
 from library import train_util
 from library import sdxl_train_util
 from library import utils
+import library.sai_model_spec as sai_model_spec
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -103,10 +104,11 @@ def cache_to_disk(args: argparse.Namespace) -> None:
                 }
 
         blueprint = blueprint_generator.generate(user_config, args)
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
         # use arbitrary dataset class
         train_dataset_group = train_util.load_arbitrary_dataset(args)
+        val_dataset_group = None
 
     # acceleratorを準備する
     logger.info("prepare accelerator")
@@ -187,6 +189,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_training_arguments(parser, True)
     train_util.add_dataset_arguments(parser, True, True, True)
     train_util.add_masked_loss_arguments(parser)

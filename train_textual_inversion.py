@@ -2,7 +2,7 @@ import argparse
 import math
 import os
 from multiprocessing import Value
-from typing import Any, List
+from typing import Any, List, Optional, Union
 import toml
 
 from tqdm import tqdm
@@ -16,7 +16,7 @@ init_ipex()
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
 from transformers import CLIPTokenizer
-from library import deepspeed_utils, model_util, strategy_base, strategy_sd
+from library import deepspeed_utils, model_util, strategy_base, strategy_sd, sai_model_spec
 
 import library.train_util as train_util
 import library.huggingface_util as huggingface_util
@@ -99,8 +99,11 @@ class TextualInversionTrainer:
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
 
-    def assert_extra_args(self, args, train_dataset_group):
+    def assert_extra_args(self, args, train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset], val_dataset_group: Optional[train_util.DatasetGroup]):
         train_dataset_group.verify_bucket_reso_steps(64)
+
+        if val_dataset_group is not None:
+            val_dataset_group.verify_bucket_reso_steps(64)
 
     def load_target_model(self, args, weight_dtype, accelerator):
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
@@ -320,11 +323,12 @@ class TextualInversionTrainer:
                     }
 
             blueprint = blueprint_generator.generate(user_config, args)
-            train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+            train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
         else:
             train_dataset_group = train_util.load_arbitrary_dataset(args)
+            val_dataset_group = None
 
-        self.assert_extra_args(args, train_dataset_group)
+        self.assert_extra_args(args, train_dataset_group, val_dataset_group)
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
@@ -575,6 +579,17 @@ class TextualInversionTrainer:
                             latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
                         latents = latents * self.vae_scale_factor
 
+                        if batch["masks"] is not None:
+                            masked_latents = vae.encode(
+                                batch["masked_images"].to(dtype=vae_dtype)
+                            ).latent_dist.sample().to(dtype=weight_dtype)
+                            masked_latents = masked_latents * self.vae_scale_factor
+
+                            # Resize the mask to latents shape as we concatenate the mask to the latents
+                            mask = torch.nn.functional.interpolate(
+                                batch["masks"].to(weight_dtype), size=latents.shape[2:]
+                            )
+
                     # Get the text embedding for conditioning
                     input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
                     text_encoder_conds = text_encoding_strategy.encode_tokens(
@@ -588,6 +603,9 @@ class TextualInversionTrainer:
                     noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
                         args, noise_scheduler, latents
                     )
+                    if batch["masks"] is not None:
+                      # Concatenate the noised latents with the mask and the masked latents
+                      noisy_latents = torch.cat([noisy_latents, mask, masked_latents], dim=1)
 
                     # Predict the noise residual
                     with accelerator.autocast():
@@ -767,6 +785,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, True, True, False)
     train_util.add_training_arguments(parser, True)
     train_util.add_masked_loss_arguments(parser)

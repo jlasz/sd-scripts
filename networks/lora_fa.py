@@ -183,7 +183,7 @@ class LoRAInfModule(LoRAModule):
 
         # extract weight from org_module
         org_sd = self.org_module.state_dict()
-        weight = org_sd["weight"].to(torch.float)
+        weight = org_sd["weight"].to(torch.float).to(device)
 
         # merge weight
         if len(weight.size()) == 2:
@@ -755,7 +755,7 @@ class LoRANetwork(torch.nn.Module):
 
     UNET_TARGET_REPLACE_MODULE = ["Transformer2DModel"]
     UNET_TARGET_REPLACE_MODULE_CONV2D_3X3 = ["ResnetBlock2D", "Downsample2D", "Upsample2D"]
-    TEXT_ENCODER_TARGET_REPLACE_MODULE = ["CLIPAttention", "CLIPMLP"]
+    TEXT_ENCODER_TARGET_REPLACE_MODULE = ["CLIPAttention", "CLIPSdpaAttention", "CLIPMLP"]
     LORA_PREFIX_UNET = "lora_unet"
     LORA_PREFIX_TEXT_ENCODER = "lora_te"
 

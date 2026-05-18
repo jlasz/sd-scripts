@@ -2,7 +2,7 @@ import argparse
 import copy
 import math
 import random
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 from accelerate import Accelerator
@@ -35,10 +35,23 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self.is_schnell: Optional[bool] = None
         self.is_swapping_blocks: bool = False
+        self.model_type: Optional[str] = None
 
-    def assert_extra_args(self, args, train_dataset_group):
-        super().assert_extra_args(args, train_dataset_group)
+    def assert_extra_args(
+        self,
+        args,
+        train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
+        val_dataset_group: Optional[train_util.DatasetGroup],
+    ):
+        super().assert_extra_args(args, train_dataset_group, val_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
+
+        self.model_type = args.model_type  # "flux" or "chroma"
+        if self.model_type != "chroma":
+            self.use_clip_l = True
+        else:
+            self.use_clip_l = False  # Chroma does not use CLIP-L
+            assert args.apply_t5_attn_mask, "apply_t5_attn_mask must be True for Chroma / Chromaではapply_t5_attn_maskを指定する必要があります"
 
         if args.fp8_base_unet:
             args.fp8_base = True  # if fp8_base_unet is enabled, fp8_base is also enabled for FLUX.1
@@ -55,7 +68,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             ), "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / Text Encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
 
         # prepare CLIP-L/T5XXL training flags
-        self.train_clip_l = not args.network_train_unet_only
+        self.train_clip_l = not args.network_train_unet_only and self.use_clip_l
         self.train_t5xxl = False  # default is False even if args.network_train_unet_only is False
 
         if args.max_token_length is not None:
@@ -80,6 +93,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 args.blocks_to_swap = 18  # 18 is safe for most cases
 
         train_dataset_group.verify_bucket_reso_steps(32)  # TODO check this
+        if val_dataset_group is not None:
+            val_dataset_group.verify_bucket_reso_steps(32)  # TODO check this
 
     def load_target_model(self, args, weight_dtype, accelerator):
         # currently offload to cpu for some models
@@ -88,8 +103,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         loading_dtype = None if args.fp8_base else weight_dtype
 
         # if we load to cpu, flux.to(fp8) takes a long time, so we should load to gpu in future
-        self.is_schnell, model = flux_utils.load_flow_model(
-            args.pretrained_model_name_or_path, loading_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors
+        _, model = flux_utils.load_flow_model(
+            args.pretrained_model_name_or_path,
+            loading_dtype,
+            "cpu",
+            disable_mmap=args.disable_mmap_load_safetensors,
+            model_type=self.model_type,
         )
         if args.fp8_base:
             # check dtype of model
@@ -113,7 +132,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
             model.enable_block_swap(args.blocks_to_swap, accelerator.device)
 
-        clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+        if self.use_clip_l:
+            clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+        else:
+            clip_l = flux_utils.dummy_clip_l()  # dummy CLIP-L for Chroma, which does not use CLIP-L
         clip_l.eval()
 
         # if the file is fp8 and we are using fp8_base (not unet), we can load it as is (fp8)
@@ -134,13 +156,20 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
 
-        return flux_utils.MODEL_VERSION_FLUX_V1, [clip_l, t5xxl], ae, model
+        model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
+        return model_version, [clip_l, t5xxl], ae, model
 
     def get_tokenize_strategy(self, args):
-        _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+        # This method is called before `assert_extra_args`, so we cannot use `self.is_schnell` here.
+        # Instead, we analyze the checkpoint state to determine if it is schnell.
+        if args.model_type != "chroma":
+            _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+        else:
+            is_schnell = False
+        self.is_schnell = is_schnell
 
         if args.t5xxl_max_token_length is None:
-            if is_schnell:
+            if self.is_schnell:
                 t5xxl_max_token_length = 256
             else:
                 t5xxl_max_token_length = 512
@@ -261,23 +290,6 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)
             text_encoders[1].to(accelerator.device)
 
-    # def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype):
-    #     noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
-
-    #     # get size embeddings
-    #     orig_size = batch["original_sizes_hw"]
-    #     crop_size = batch["crop_top_lefts"]
-    #     target_size = batch["target_sizes_hw"]
-    #     embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-    #     # concat embeddings
-    #     encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
-    #     vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-    #     text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
-
-    #     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
-    #     return noise_pred
-
     def sample_images(self, accelerator, args, epoch, global_step, device, ae, tokenizer, text_encoder, flux):
         text_encoders = text_encoder  # for compatibility
         text_encoders = self.get_models_for_text_encoding(args, accelerator, text_encoders)
@@ -285,43 +297,13 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         flux_train_utils.sample_images(
             accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs
         )
-        # return
-
-        """
-        class FluxUpperLowerWrapper(torch.nn.Module):
-            def __init__(self, flux_upper: flux_models.FluxUpper, flux_lower: flux_models.FluxLower, device: torch.device):
-                super().__init__()
-                self.flux_upper = flux_upper
-                self.flux_lower = flux_lower
-                self.target_device = device
-
-            def prepare_block_swap_before_forward(self):
-                pass
-
-            def forward(self, img, img_ids, txt, txt_ids, timesteps, y, guidance=None, txt_attention_mask=None):
-                self.flux_lower.to("cpu")
-                clean_memory_on_device(self.target_device)
-                self.flux_upper.to(self.target_device)
-                img, txt, vec, pe = self.flux_upper(img, img_ids, txt, txt_ids, timesteps, y, guidance, txt_attention_mask)
-                self.flux_upper.to("cpu")
-                clean_memory_on_device(self.target_device)
-                self.flux_lower.to(self.target_device)
-                return self.flux_lower(img, txt, vec, pe, txt_attention_mask)
-
-        wrapper = FluxUpperLowerWrapper(self.flux_upper, flux, accelerator.device)
-        clean_memory_on_device(accelerator.device)
-        flux_train_utils.sample_images(
-            accelerator, args, epoch, global_step, wrapper, ae, text_encoders, self.sample_prompts_te_outputs
-        )
-        clean_memory_on_device(accelerator.device)
-        """
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         noise_scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
         self.noise_scheduler_copy = copy.deepcopy(noise_scheduler)
         return noise_scheduler
 
-    def encode_images_to_latents(self, args, accelerator, vae, images):
+    def encode_images_to_latents(self, args, vae, images):
         return vae.encode(images)
 
     def shift_scale_latents(self, args, latents):
@@ -339,6 +321,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        is_train=True,
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
@@ -358,7 +341,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # ensure guidance_scale in args is float
         guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
 
-        # ensure the hidden state will require grad
+        # get modulation vectors for Chroma
+        with accelerator.autocast(), torch.no_grad():
+            mod_vectors = unet.get_mod_vectors(timesteps=timesteps / 1000, guidance=guidance_vec, batch_size=bsz)
+
         if args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)
             for t in text_encoder_conds:
@@ -366,16 +352,17 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     t.requires_grad_(True)
             img_ids.requires_grad_(True)
             guidance_vec.requires_grad_(True)
+            if mod_vectors is not None:
+                mod_vectors.requires_grad_(True)
 
         # Predict the noise residual
         l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
         if not args.apply_t5_attn_mask:
             t5_attn_mask = None
 
-        def call_dit(img, img_ids, t5_out, txt_ids, l_pooled, timesteps, guidance_vec, t5_attn_mask):
-            # if not args.split_mode:
-            # normal forward
-            with accelerator.autocast():
+        def call_dit(img, img_ids, t5_out, txt_ids, l_pooled, timesteps, guidance_vec, t5_attn_mask, mod_vectors):
+            # grad is enabled even if unet is not in train mode, because Text Encoder is in train mode
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
                 # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transformer model (we should not keep it but I want to keep the inputs same for the model for testing)
                 model_pred = unet(
                     img=img,
@@ -386,43 +373,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     timesteps=timesteps / 1000,
                     guidance=guidance_vec,
                     txt_attention_mask=t5_attn_mask,
+                    mod_vectors=mod_vectors,
                 )
-            """
-            else:
-                # split forward to reduce memory usage
-                assert network.train_blocks == "single", "train_blocks must be single for split mode"
-                with accelerator.autocast():
-                    # move flux lower to cpu, and then move flux upper to gpu
-                    unet.to("cpu")
-                    clean_memory_on_device(accelerator.device)
-                    self.flux_upper.to(accelerator.device)
-
-                    # upper model does not require grad
-                    with torch.no_grad():
-                        intermediate_img, intermediate_txt, vec, pe = self.flux_upper(
-                            img=packed_noisy_model_input,
-                            img_ids=img_ids,
-                            txt=t5_out,
-                            txt_ids=txt_ids,
-                            y=l_pooled,
-                            timesteps=timesteps / 1000,
-                            guidance=guidance_vec,
-                            txt_attention_mask=t5_attn_mask,
-                        )
-
-                    # move flux upper back to cpu, and then move flux lower to gpu
-                    self.flux_upper.to("cpu")
-                    clean_memory_on_device(accelerator.device)
-                    unet.to(accelerator.device)
-
-                    # lower model requires grad
-                    intermediate_img.requires_grad_(True)
-                    intermediate_txt.requires_grad_(True)
-                    vec.requires_grad_(True)
-                    pe.requires_grad_(True)
-                    model_pred = unet(img=intermediate_img, txt=intermediate_txt, vec=vec, pe=pe, txt_attention_mask=t5_attn_mask)
-            """
-
             return model_pred
 
         model_pred = call_dit(
@@ -434,6 +386,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             timesteps=timesteps,
             guidance_vec=guidance_vec,
             t5_attn_mask=t5_attn_mask,
+            mod_vectors=mod_vectors,
         )
 
         # unpack latents
@@ -465,6 +418,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                         timesteps=timesteps[diff_output_pr_indices],
                         guidance_vec=guidance_vec[diff_output_pr_indices] if guidance_vec is not None else None,
                         t5_attn_mask=t5_attn_mask[diff_output_pr_indices] if t5_attn_mask is not None else None,
+                        mod_vectors=mod_vectors[diff_output_pr_indices] if mod_vectors is not None else None,
                     )
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
 
@@ -483,9 +437,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         return loss
 
     def get_sai_model_spec(self, args):
-        return train_util.get_sai_model_spec(None, args, False, True, False, flux="dev")
+        if self.model_type != "chroma":
+            model_description = "schnell" if self.is_schnell else "dev"
+        else:
+            model_description = "chroma"
+        return train_util.get_sai_model_spec(None, args, False, True, False, flux=model_description)
 
     def update_metadata(self, metadata, args):
+        metadata["ss_model_type"] = args.model_type
         metadata["ss_apply_t5_attn_mask"] = args.apply_t5_attn_mask
         metadata["ss_weighting_scheme"] = args.weighting_scheme
         metadata["ss_logit_mean"] = args.logit_mean
@@ -540,6 +499,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 logger.info(f"prepare T5XXL for fp8: set to {te_weight_dtype}, set embeddings to {weight_dtype}, add hooks")
                 text_encoder.to(te_weight_dtype)  # fp8
                 prepare_fp8(text_encoder, weight_dtype)
+
+    def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+        if self.is_swapping_blocks:
+            # prepare for next forward: because backward pass is not called, we need to prepare it here
+            accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module

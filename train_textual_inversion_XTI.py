@@ -21,6 +21,7 @@ import library
 import library.train_util as train_util
 import library.huggingface_util as huggingface_util
 import library.config_util as config_util
+import library.sai_model_spec as sai_model_spec
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -239,7 +240,7 @@ def train(args):
             }
 
     blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
-    train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     train_dataset_group.enable_XTI(XTI_layers, token_strings=token_strings)
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -668,6 +669,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, True, True, False)
     train_util.add_training_arguments(parser, True)
     train_util.add_masked_loss_arguments(parser)
