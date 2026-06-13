@@ -4956,6 +4956,72 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
     accelerator.load_state(dirname)
 
 
+def is_adv_optm_optimizer_type(optimizer_type: Optional[str]) -> bool:
+    if optimizer_type is None:
+        return False
+    return "adv_optm" in optimizer_type.lower()
+
+
+def _get_adv_optm_parameter_tag(name: str) -> Optional[str]:
+    parts = name.split(".")
+
+    if name.endswith(("lokr_w1_b", "lokr_w2_b")):
+        return "_is_lora_A"
+    if name.endswith(("lokr_w1_a", "lokr_w2_a")):
+        return "_is_lora_B"
+    if name.endswith(("dora_scale", "dora_log_multiplier")):
+        return "_is_dora_scale"
+    if name.endswith("oft_R.weight"):
+        return "_is_oft"
+
+    if parts[-1:] == ["weight"]:
+        if len(parts) >= 2 and parts[-2] in ("lora_down", "lora_A"):
+            return "_is_lora_A"
+        if len(parts) >= 2 and parts[-2] in ("lora_up", "lora_B"):
+            return "_is_lora_B"
+        if len(parts) >= 3 and parts[-3] in ("lora_down", "lora_A"):
+            return "_is_lora_A"
+        if len(parts) >= 3 and parts[-3] in ("lora_up", "lora_B"):
+            return "_is_lora_B"
+
+    return None
+
+
+def tag_adv_optm_trainable_parameters(module: Optional[torch.nn.Module]) -> Dict[str, int]:
+    """Tag PEFT trainable params with the private attributes used by adv_optm."""
+    counts = {
+        "lora_A": 0,
+        "lora_B": 0,
+        "dora_scale": 0,
+        "oft": 0,
+    }
+
+    if module is None or not hasattr(module, "named_parameters"):
+        return counts
+
+    tag_to_count = {
+        "_is_lora_A": "lora_A",
+        "_is_lora_B": "lora_B",
+        "_is_dora_scale": "dora_scale",
+        "_is_oft": "oft",
+    }
+    seen = set()
+
+    for name, param in module.named_parameters():
+        if id(param) in seen or not param.requires_grad:
+            continue
+        seen.add(id(param))
+
+        tag = _get_adv_optm_parameter_tag(name)
+        if tag is None:
+            continue
+
+        setattr(param, tag, True)
+        counts[tag_to_count[tag]] += 1
+
+    return counts
+
+
 def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
     # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, AdEMAMix8bit, PagedAdEMAMix8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
 

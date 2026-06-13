@@ -1025,6 +1025,12 @@ class NetworkTrainer:
         #             v = len(v)
         #         accelerator.print(f"trainable_params: {k} = {v}")
 
+        if train_util.is_adv_optm_optimizer_type(args.optimizer_type):
+            adv_optm_tag_counts = train_util.tag_adv_optm_trainable_parameters(network)
+            tag_text = ", ".join(f"{name}={count}" for name, count in adv_optm_tag_counts.items() if count > 0)
+            if tag_text:
+                accelerator.print(f"tagged trainable parameters for adv_optm scaling: {tag_text}")
+
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
         optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
 
