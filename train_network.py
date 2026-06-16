@@ -215,6 +215,13 @@ class WeightValueTracker:
 
         return selected
 
+    def resample(self, network: torch.nn.Module, count: int, seed: int):
+        if not self.enabled:
+            return
+        self.tracked_weights = self.sample_weights(network, count, seed)
+        if len(self.tracked_weights) == 0:
+            raise ValueError("no trainable weight parameters were found for --track_weight_values")
+
     def record(self, step: int, epoch: int):
         if not self.enabled or self.writer is None:
             return
@@ -245,10 +252,310 @@ class WeightValueTracker:
             self.csv_file = None
 
 
+class LoRASqueezeSchedule:
+    def __init__(self, args: argparse.Namespace):
+        start_dim = args.lora_squeeze_start_dim
+        num_squeezes = args.lora_squeeze_num_squeezes
+        alias_num_squeezes = getattr(args, "lora_squeeze_amount_of_squeezes", None)
+        if num_squeezes == 0 and alias_num_squeezes is not None:
+            num_squeezes = alias_num_squeezes
+        self.enabled = start_dim is not None or num_squeezes > 0
+
+        self.start_dim = start_dim
+        self.target_dim = args.network_dim
+        self.target_alpha = args.network_alpha
+        self.num_squeezes = num_squeezes
+        self.train_after_final_squeeze = args.lora_squeeze_train_after_final_squeeze
+        self.ranks: List[int] = []
+        self.squeeze_steps: List[int] = []
+        self.next_squeeze_index = 0
+        self.current_dim = args.network_dim
+        self.current_alpha = args.network_alpha
+
+        if not self.enabled:
+            return
+
+        if self.start_dim is None:
+            raise ValueError("--lora_squeeze_start_dim is required when LoRA-Squeeze is enabled")
+        if self.target_dim is None:
+            raise ValueError("--network_dim is required when LoRA-Squeeze is enabled")
+        if self.target_alpha is None:
+            raise ValueError("--network_alpha is required when LoRA-Squeeze is enabled")
+        if self.start_dim <= self.target_dim:
+            raise ValueError("--lora_squeeze_start_dim must be greater than --network_dim")
+        if self.num_squeezes <= 0:
+            raise ValueError("--lora_squeeze_num_squeezes must be greater than 0")
+        if self.target_dim <= 0:
+            raise ValueError("--network_dim must be greater than 0 when LoRA-Squeeze is enabled")
+        if self.target_alpha <= 0:
+            raise ValueError("--network_alpha must be greater than 0 when LoRA-Squeeze is enabled")
+
+        self.ranks = self._build_rank_schedule()
+        self.current_dim = self.start_dim
+        self.current_alpha = self.alpha_for_rank(self.current_dim)
+
+    def _build_rank_schedule(self) -> List[int]:
+        ranks = [int(self.start_dim)]
+        rank_delta = self.start_dim - self.target_dim
+        for i in range(1, self.num_squeezes + 1):
+            if i == self.num_squeezes:
+                rank = self.target_dim
+            else:
+                rank = math.floor(self.start_dim - rank_delta * i / self.num_squeezes)
+
+            if rank >= ranks[-1]:
+                raise ValueError(
+                    "LoRA-Squeeze rank schedule is not strictly decreasing. "
+                    "Use fewer squeezes or a larger start_dim-target_dim gap."
+                )
+            if rank < self.target_dim:
+                raise ValueError("LoRA-Squeeze rank schedule went below --network_dim")
+            ranks.append(int(rank))
+        return ranks
+
+    def alpha_for_rank(self, rank: int) -> float:
+        return float(self.target_alpha / math.sqrt(self.target_dim) * math.sqrt(rank))
+
+    def set_total_steps(self, max_train_steps: int):
+        if not self.enabled:
+            return
+
+        training_segments = self.num_squeezes + (1 if self.train_after_final_squeeze else 0)
+        if max_train_steps < training_segments:
+            raise ValueError(
+                f"max_train_steps={max_train_steps} is too small for {training_segments} LoRA-Squeeze training segments"
+            )
+
+        steps = [math.floor(max_train_steps * i / training_segments) for i in range(1, self.num_squeezes + 1)]
+        previous_step = 0
+        for step in steps:
+            if step <= previous_step:
+                raise ValueError(
+                    "LoRA-Squeeze step schedule is not strictly increasing. "
+                    "Use fewer squeezes or more max_train_steps."
+                )
+            previous_step = step
+        self.squeeze_steps = steps
+
+    @property
+    def completed_squeezes(self) -> int:
+        return self.next_squeeze_index
+
+    def next_due(self, global_step: int) -> Optional[Dict[str, Union[int, float]]]:
+        if not self.enabled or self.next_squeeze_index >= self.num_squeezes:
+            return None
+        if global_step < self.squeeze_steps[self.next_squeeze_index]:
+            return None
+
+        next_dim = self.ranks[self.next_squeeze_index + 1]
+        return {
+            "step": self.squeeze_steps[self.next_squeeze_index],
+            "dim": next_dim,
+            "alpha": self.alpha_for_rank(next_dim),
+        }
+
+    def mark_squeezed(self, dim: int, alpha: float):
+        self.current_dim = dim
+        self.current_alpha = alpha
+        self.next_squeeze_index += 1
+
+    def rank_schedule_text(self) -> str:
+        return " -> ".join(str(rank) for rank in self.ranks)
+
+    def step_schedule_text(self) -> str:
+        if not self.squeeze_steps:
+            return ""
+        return ", ".join(
+            f"step {step}: {self.ranks[i]}->{self.ranks[i + 1]}"
+            for i, step in enumerate(self.squeeze_steps)
+        )
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+
+    @staticmethod
+    def get_lora_squeeze_modules(network: torch.nn.Module) -> List[torch.nn.Module]:
+        modules: List[torch.nn.Module] = []
+        for module in network.modules():
+            if not hasattr(module, "lora_down") or not hasattr(module, "lora_up"):
+                continue
+            if not isinstance(module.lora_down, (nn.Linear, nn.Conv2d)):
+                continue
+            if not isinstance(module.lora_up, (nn.Linear, nn.Conv2d)):
+                continue
+            modules.append(module)
+        return modules
+
+    @staticmethod
+    def get_lora_module_rank(module: torch.nn.Module) -> int:
+        return int(module.lora_down.weight.shape[0])
+
+    @staticmethod
+    def get_lora_module_alpha(module: torch.nn.Module) -> float:
+        alpha = getattr(module, "alpha", None)
+        if alpha is None:
+            return float(NetworkTrainer.get_lora_module_rank(module))
+        if isinstance(alpha, torch.Tensor):
+            return float(alpha.detach().float().item())
+        return float(alpha)
+
+    @staticmethod
+    def get_lora_factor_matrices(module: torch.nn.Module):
+        down = module.lora_down.weight.detach().float()
+        up = module.lora_up.weight.detach().float()
+
+        if isinstance(module.lora_down, nn.Linear) and isinstance(module.lora_up, nn.Linear):
+            return up, down, "linear"
+
+        if isinstance(module.lora_down, nn.Conv2d) and isinstance(module.lora_up, nn.Conv2d):
+            if tuple(module.lora_up.kernel_size) != (1, 1):
+                raise ValueError(f"LoRA-Squeeze only supports 1x1 lora_up convs: {module.lora_name}")
+            up_2d = up[:, :, 0, 0]
+            down_2d = down.reshape(down.shape[0], -1)
+            return up_2d, down_2d, "conv2d"
+
+        raise ValueError(f"LoRA-Squeeze does not support mixed LoRA layer types: {module.lora_name}")
+
+    @staticmethod
+    def compact_lora_product(up_2d: torch.Tensor, down_2d: torch.Tensor, old_scale: float, target_dim: int):
+        # SVD of (up @ down * old_scale) through the rank-sized core.
+        a = up_2d
+        b = down_2d * old_scale
+        qa, ra = torch.linalg.qr(a, mode="reduced")
+        qb, rb = torch.linalg.qr(b.T, mode="reduced")
+        core = ra @ rb.T
+        u_core, singular_values, vh_core = torch.linalg.svd(core, full_matrices=False)
+
+        usable_dim = min(target_dim, singular_values.numel())
+        u = qa @ u_core[:, :usable_dim]
+        vh = vh_core[:usable_dim, :] @ qb.T
+        return u, singular_values, vh
+
+    @staticmethod
+    def replace_lora_module_layers(
+        module: torch.nn.Module,
+        new_up_2d: torch.Tensor,
+        new_down_2d: torch.Tensor,
+        target_dim: int,
+        target_alpha: float,
+        kind: str,
+    ):
+        old_down = module.lora_down
+        old_up = module.lora_up
+        device = old_down.weight.device
+        down_dtype = old_down.weight.dtype
+        up_dtype = old_up.weight.dtype
+
+        if kind == "linear":
+            new_down = nn.Linear(old_down.in_features, target_dim, bias=False, device=device, dtype=down_dtype)
+            new_up = nn.Linear(target_dim, old_up.out_features, bias=False, device=device, dtype=up_dtype)
+            down_weight = new_down_2d
+            up_weight = new_up_2d
+        elif kind == "conv2d":
+            new_down = nn.Conv2d(
+                old_down.in_channels,
+                target_dim,
+                old_down.kernel_size,
+                old_down.stride,
+                old_down.padding,
+                old_down.dilation,
+                old_down.groups,
+                bias=False,
+                padding_mode=old_down.padding_mode,
+                device=device,
+                dtype=down_dtype,
+            )
+            new_up = nn.Conv2d(
+                target_dim,
+                old_up.out_channels,
+                old_up.kernel_size,
+                old_up.stride,
+                old_up.padding,
+                old_up.dilation,
+                old_up.groups,
+                bias=False,
+                padding_mode=old_up.padding_mode,
+                device=device,
+                dtype=up_dtype,
+            )
+            down_weight = new_down_2d.reshape(target_dim, *old_down.weight.shape[1:])
+            up_weight = new_up_2d.reshape(old_up.out_channels, target_dim, *old_up.weight.shape[2:])
+        else:
+            raise ValueError(f"unknown LoRA layer kind: {kind}")
+
+        new_down.train(old_down.training)
+        new_up.train(old_up.training)
+        with torch.no_grad():
+            new_down.weight.copy_(down_weight.to(device=device, dtype=down_dtype))
+            new_up.weight.copy_(up_weight.to(device=device, dtype=up_dtype))
+
+        module.lora_down = new_down
+        module.lora_up = new_up
+        module.lora_dim = target_dim
+        module.scale = target_alpha / target_dim
+        old_alpha = getattr(module, "alpha", None)
+        alpha_dtype = old_alpha.dtype if isinstance(old_alpha, torch.Tensor) else down_dtype
+        alpha_tensor = torch.tensor(target_alpha, device=device, dtype=alpha_dtype)
+        if isinstance(old_alpha, torch.Tensor):
+            module.alpha = alpha_tensor
+        else:
+            module.register_buffer("alpha", alpha_tensor)
+
+    def squeeze_lora_network(self, network: torch.nn.Module, target_dim: int, target_alpha: float) -> Dict[str, float]:
+        lora_modules = self.get_lora_squeeze_modules(network)
+        if len(lora_modules) == 0:
+            raise ValueError("LoRA-Squeeze did not find any LoRA modules with lora_down/lora_up weights")
+
+        source_ranks = {self.get_lora_module_rank(module) for module in lora_modules}
+        if len(source_ranks) != 1:
+            raise ValueError(f"LoRA-Squeeze requires a homogeneous current rank, found ranks: {sorted(source_ranks)}")
+        source_rank = next(iter(source_ranks))
+        if target_dim >= source_rank:
+            raise ValueError(f"LoRA-Squeeze target rank {target_dim} must be less than current rank {source_rank}")
+
+        retained_energies: List[float] = []
+        with torch.no_grad():
+            for module in lora_modules:
+                old_rank = self.get_lora_module_rank(module)
+                old_alpha = self.get_lora_module_alpha(module)
+                old_scale = old_alpha / old_rank
+                up_2d, down_2d, kind = self.get_lora_factor_matrices(module)
+
+                u, singular_values, vh = self.compact_lora_product(up_2d, down_2d, old_scale, target_dim)
+                usable_dim = min(target_dim, singular_values.numel())
+                kept = singular_values[:usable_dim].clamp_min(0)
+                total_energy = torch.sum(singular_values * singular_values).item()
+                kept_energy = torch.sum(kept * kept).item()
+                retained_energies.append(1.0 if total_energy == 0.0 else kept_energy / total_energy)
+
+                factor_scale = math.sqrt(target_dim / target_alpha)
+                sqrt_s = torch.sqrt(kept)
+                new_up_2d = torch.zeros(
+                    (up_2d.shape[0], target_dim),
+                    device=up_2d.device,
+                    dtype=up_2d.dtype,
+                )
+                new_down_2d = torch.zeros(
+                    (target_dim, down_2d.shape[1]),
+                    device=down_2d.device,
+                    dtype=down_2d.dtype,
+                )
+                if usable_dim > 0:
+                    new_up_2d[:, :usable_dim] = u[:, :usable_dim] * sqrt_s.unsqueeze(0) * factor_scale
+                    new_down_2d[:usable_dim, :] = sqrt_s.unsqueeze(1) * vh[:usable_dim, :] * factor_scale
+
+                self.replace_lora_module_layers(module, new_up_2d, new_down_2d, target_dim, target_alpha, kind)
+
+        return {
+            "modules": float(len(lora_modules)),
+            "source_rank": float(source_rank),
+            "target_rank": float(target_dim),
+            "retained_energy_min": min(retained_energies),
+            "retained_energy_mean": sum(retained_energies) / len(retained_energies),
+        }
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -850,10 +1157,23 @@ class NetworkTrainer:
 
         self.assert_extra_args(args, train_dataset_group, val_dataset_group)  # may change some args
 
+        lora_squeeze_schedule = LoRASqueezeSchedule(args)
+        if lora_squeeze_schedule.enabled:
+            if args.dim_from_weights:
+                raise ValueError("LoRA-Squeeze does not support --dim_from_weights because --network_dim is the target rank")
+            if args.deepspeed:
+                raise ValueError("LoRA-Squeeze does not support DeepSpeed yet")
+            if args.resume:
+                raise ValueError("LoRA-Squeeze resume is not supported yet because saved states may have a different rank")
+            if args.initial_step is not None or args.initial_epoch is not None:
+                raise ValueError("LoRA-Squeeze does not support --initial_step or --initial_epoch yet")
+
         # acceleratorを準備する
         logger.info("preparing accelerator")
         accelerator = train_util.prepare_accelerator(args)
         is_main_process = accelerator.is_main_process
+        if lora_squeeze_schedule.enabled and accelerator.num_processes != 1:
+            raise ValueError("LoRA-Squeeze currently supports only single-process training")
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = train_util.prepare_dtype(args)
@@ -936,10 +1256,18 @@ class NetworkTrainer:
                 # workaround for LyCORIS (;^ω^)
                 net_kwargs["dropout"] = args.network_dropout
 
+            initial_network_dim = lora_squeeze_schedule.current_dim if lora_squeeze_schedule.enabled else args.network_dim
+            initial_network_alpha = lora_squeeze_schedule.current_alpha if lora_squeeze_schedule.enabled else args.network_alpha
+            if lora_squeeze_schedule.enabled:
+                accelerator.print(
+                    f"LoRA-Squeeze enabled. rank schedule: {lora_squeeze_schedule.rank_schedule_text()}; "
+                    f"initial alpha: {initial_network_alpha:.8g}"
+                )
+
             network = network_module.create_network(
                 1.0,
-                args.network_dim,
-                args.network_alpha,
+                initial_network_dim,
+                initial_network_alpha,
                 vae,
                 text_encoder,
                 unet,
@@ -1073,6 +1401,9 @@ class NetworkTrainer:
 
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
+        lora_squeeze_schedule.set_total_steps(args.max_train_steps)
+        if lora_squeeze_schedule.enabled:
+            accelerator.print(f"LoRA-Squeeze step schedule: {lora_squeeze_schedule.step_schedule_text()}")
 
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
@@ -1285,8 +1616,8 @@ class NetworkTrainer:
             "ss_lr_warmup_steps": args.lr_warmup_steps,
             "ss_lr_scheduler": args.lr_scheduler,
             "ss_network_module": args.network_module,
-            "ss_network_dim": args.network_dim,  # None means default because another network than LoRA may have another default dim
-            "ss_network_alpha": args.network_alpha,  # some networks may not have alpha
+            "ss_network_dim": lora_squeeze_schedule.current_dim if lora_squeeze_schedule.enabled else args.network_dim,  # None means default because another network than LoRA may have another default dim
+            "ss_network_alpha": lora_squeeze_schedule.current_alpha if lora_squeeze_schedule.enabled else args.network_alpha,  # some networks may not have alpha
             "ss_network_dropout": args.network_dropout,  # some networks may not have dropout
             "ss_mixed_precision": args.mixed_precision,
             "ss_full_fp16": bool(args.full_fp16),
@@ -1325,6 +1656,17 @@ class NetworkTrainer:
             "ss_fp8_base_unet": bool(args.fp8_base_unet),
             "ss_target_total_rms": args.target_total_rms,
             "ss_total_rms_check_every_n_steps": args.total_rms_check_every_n_steps,
+            "ss_lora_squeeze_enabled": bool(lora_squeeze_schedule.enabled),
+            "ss_lora_squeeze_start_dim": lora_squeeze_schedule.start_dim,
+            "ss_lora_squeeze_target_dim": lora_squeeze_schedule.target_dim,
+            "ss_lora_squeeze_target_alpha": lora_squeeze_schedule.target_alpha,
+            "ss_lora_squeeze_num_squeezes": lora_squeeze_schedule.num_squeezes,
+            "ss_lora_squeeze_train_after_final_squeeze": bool(lora_squeeze_schedule.train_after_final_squeeze),
+            "ss_lora_squeeze_rank_schedule": json.dumps(lora_squeeze_schedule.ranks),
+            "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
+            "ss_lora_squeeze_current_dim": lora_squeeze_schedule.current_dim,
+            "ss_lora_squeeze_current_alpha": lora_squeeze_schedule.current_alpha,
+            "ss_lora_squeeze_completed_squeezes": lora_squeeze_schedule.completed_squeezes,
             "ss_validation_seed": args.validation_seed,
             "ss_validation_split": args.validation_split,
             "ss_max_validation_steps": args.max_validation_steps,
@@ -1499,6 +1841,23 @@ class NetworkTrainer:
             if key in metadata:
                 minimum_metadata[key] = metadata[key]
 
+        def update_lora_squeeze_metadata():
+            if not lora_squeeze_schedule.enabled:
+                return
+
+            dynamic_values = {
+                "ss_network_dim": lora_squeeze_schedule.current_dim,
+                "ss_network_alpha": lora_squeeze_schedule.current_alpha,
+                "ss_lora_squeeze_current_dim": lora_squeeze_schedule.current_dim,
+                "ss_lora_squeeze_current_alpha": lora_squeeze_schedule.current_alpha,
+                "ss_lora_squeeze_completed_squeezes": lora_squeeze_schedule.completed_squeezes,
+                "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
+            }
+            for key, value in dynamic_values.items():
+                metadata[key] = str(value)
+                if key in minimum_metadata:
+                    minimum_metadata[key] = str(value)
+
         # calculate steps to skip when resuming or starting from a specific step
         initial_step = 0
         if args.initial_epoch is not None or args.initial_step is not None:
@@ -1565,6 +1924,72 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
+        def rebuild_optimizer_for_current_network(sync_scheduler_to_step: int):
+            nonlocal optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn, lr_scheduler, lr_descriptions
+
+            old_optimizer = optimizer
+            old_lr_scheduler = lr_scheduler
+            unwrapped_network = accelerator.unwrap_model(network)
+            try:
+                if support_multiple_lrs:
+                    results = unwrapped_network.prepare_optimizer_params_with_multiple_te_lrs(
+                        text_encoder_lr, args.unet_lr, args.learning_rate
+                    )
+                else:
+                    results = unwrapped_network.prepare_optimizer_params(text_encoder_lr, args.unet_lr, args.learning_rate)
+                if type(results) is tuple:
+                    trainable_params = results[0]
+                    lr_descriptions = results[1]
+                else:
+                    trainable_params = results
+                    lr_descriptions = None
+            except TypeError:
+                trainable_params = unwrapped_network.prepare_optimizer_params(text_encoder_lr, args.unet_lr)
+                lr_descriptions = None
+
+            if train_util.is_adv_optm_optimizer_type(args.optimizer_type):
+                train_util.tag_adv_optm_trainable_parameters(unwrapped_network)
+
+            optimizer_name, optimizer_args, new_optimizer = train_util.get_optimizer(args, trainable_params)
+            new_lr_scheduler = train_util.get_scheduler_fix(args, new_optimizer, accelerator.num_processes)
+            optimizer, lr_scheduler = accelerator.prepare(new_optimizer, new_lr_scheduler)
+            for _ in range(sync_scheduler_to_step):
+                lr_scheduler.step()
+            optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
+            optimizer_train_fn()
+
+            raw_old_optimizer = getattr(old_optimizer, "optimizer", old_optimizer)
+            if hasattr(raw_old_optimizer, "state"):
+                raw_old_optimizer.state.clear()
+            if hasattr(accelerator, "_optimizers"):
+                accelerator._optimizers = [opt for opt in accelerator._optimizers if opt is not old_optimizer]
+            if hasattr(accelerator, "_schedulers"):
+                accelerator._schedulers = [scheduler for scheduler in accelerator._schedulers if scheduler is not old_lr_scheduler]
+
+        def run_lora_squeeze_if_due(global_step: int):
+            event = lora_squeeze_schedule.next_due(global_step)
+            if event is None:
+                return
+
+            target_dim = int(event["dim"])
+            target_alpha = float(event["alpha"])
+            unwrapped_network = accelerator.unwrap_model(network)
+            accelerator.wait_for_everyone()
+            stats = self.squeeze_lora_network(unwrapped_network, target_dim, target_alpha)
+            lora_squeeze_schedule.mark_squeezed(target_dim, target_alpha)
+            update_lora_squeeze_metadata()
+            unwrapped_network.prepare_grad_etc(text_encoder, unet)
+            weight_value_tracker.resample(unwrapped_network, args.weight_track_count, args.weight_track_seed)
+
+            accelerator.print(
+                f"LoRA-Squeeze at step {global_step}: rank {int(stats['source_rank'])} -> {target_dim}, "
+                f"alpha={target_alpha:.8g}, retained_energy_min={stats['retained_energy_min']:.6f}, "
+                f"retained_energy_mean={stats['retained_energy_mean']:.6f}"
+            )
+
+            rebuild_optimizer_for_current_network(global_step)
+            clean_memory_on_device(accelerator.device)
+
         # function for saving/removing
         def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1574,6 +1999,7 @@ class NetworkTrainer:
             metadata["ss_training_finished_at"] = str(time.time())
             metadata["ss_steps"] = str(steps)
             metadata["ss_epoch"] = str(epoch_no)
+            update_lora_squeeze_metadata()
 
             metadata_to_save = minimum_metadata if args.no_metadata else metadata
             sai_metadata = self.get_sai_model_spec(args)
@@ -1782,6 +2208,8 @@ class NetworkTrainer:
                             )
                             stop_due_to_total_rms = True
 
+                    run_lora_squeeze_if_due(global_step)
+
                     optimizer_eval_fn()
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
@@ -1811,6 +2239,8 @@ class NetworkTrainer:
 
                 if last_total_rms is not None:
                     logs["total_rms"] = last_total_rms
+                if lora_squeeze_schedule.enabled:
+                    logs["lora_squeeze_dim"] = lora_squeeze_schedule.current_dim
 
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
@@ -1830,6 +2260,10 @@ class NetworkTrainer:
                     )
                     if last_total_rms is not None:
                         logs["strength/total_rms"] = last_total_rms
+                    if lora_squeeze_schedule.enabled:
+                        logs["lora_squeeze/current_dim"] = lora_squeeze_schedule.current_dim
+                        logs["lora_squeeze/current_alpha"] = lora_squeeze_schedule.current_alpha
+                        logs["lora_squeeze/completed_squeezes"] = lora_squeeze_schedule.completed_squeezes
                     self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
@@ -2060,6 +2494,27 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=25,
         help="check total scaled adapter RMS every N optimizer steps",
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_start_dim",
+        type=int,
+        default=None,
+        help="initial LoRA rank for LoRA-Squeeze; --network_dim remains the final target rank",
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_num_squeezes",
+        "--lora_squeeze_amount_of_squeezes",
+        type=int,
+        default=0,
+        help="number of scheduled LoRA-Squeeze rank reductions to perform",
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_train_after_final_squeeze",
+        action="store_true",
+        help="continue training for one final segment after squeezing to --network_dim",
     )
 
     parser.add_argument(
