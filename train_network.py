@@ -253,6 +253,13 @@ class WeightValueTracker:
 
 
 class LoRASqueezeSchedule:
+    STEP_SCHEDULE_CHOICES = (
+        "rank_proportional",
+        "sqrt_rank_proportional",
+        "inverse_rank_proportional",
+        "inverse_sqrt_rank_proportional",
+    )
+
     def __init__(self, args: argparse.Namespace):
         start_dim = args.lora_squeeze_start_dim
         num_squeezes = args.lora_squeeze_num_squeezes
@@ -266,8 +273,14 @@ class LoRASqueezeSchedule:
         self.target_alpha = args.network_alpha
         self.num_squeezes = num_squeezes
         self.train_after_final_squeeze = args.lora_squeeze_train_after_final_squeeze
+        self.step_schedule = getattr(args, "lora_squeeze_step_schedule", None)
+        self.final_segment_ratio = getattr(args, "lora_squeeze_final_segment_ratio", 1.0)
+        if self.final_segment_ratio is None:
+            self.final_segment_ratio = 1.0
         self.ranks: List[int] = []
         self.squeeze_steps: List[int] = []
+        self.segment_steps: List[int] = []
+        self.segment_weights: List[float] = []
         self.next_squeeze_index = 0
         self.current_dim = args.network_dim
         self.current_alpha = args.network_alpha
@@ -289,6 +302,12 @@ class LoRASqueezeSchedule:
             raise ValueError("--network_dim must be greater than 0 when LoRA-Squeeze is enabled")
         if self.target_alpha <= 0:
             raise ValueError("--network_alpha must be greater than 0 when LoRA-Squeeze is enabled")
+        if self.step_schedule is not None and self.step_schedule not in self.STEP_SCHEDULE_CHOICES:
+            raise ValueError(
+                "--lora_squeeze_step_schedule must be one of: " + ", ".join(self.STEP_SCHEDULE_CHOICES)
+            )
+        if self.final_segment_ratio <= 0:
+            raise ValueError("--lora_squeeze_final_segment_ratio must be greater than 0")
 
         self.ranks = self._build_rank_schedule()
         self.current_dim = self.start_dim
@@ -316,17 +335,44 @@ class LoRASqueezeSchedule:
     def alpha_for_rank(self, rank: int) -> float:
         return float(self.target_alpha / math.sqrt(self.target_dim) * math.sqrt(rank))
 
+    def _weight_for_rank(self, rank: int) -> float:
+        if self.step_schedule is None:
+            return 1.0
+        if self.step_schedule == "rank_proportional":
+            return float(rank)
+        if self.step_schedule == "sqrt_rank_proportional":
+            return math.sqrt(rank)
+        if self.step_schedule == "inverse_rank_proportional":
+            return 1.0 / float(rank)
+        if self.step_schedule == "inverse_sqrt_rank_proportional":
+            return 1.0 / math.sqrt(rank)
+        raise ValueError("--lora_squeeze_step_schedule must be one of: " + ", ".join(self.STEP_SCHEDULE_CHOICES))
+
+    def _build_segment_weights(self) -> List[float]:
+        segment_ranks = self.ranks if self.train_after_final_squeeze else self.ranks[:-1]
+        weights = [self._weight_for_rank(rank) for rank in segment_ranks]
+        if self.train_after_final_squeeze:
+            weights[-1] *= self.final_segment_ratio
+        return weights
+
     def set_total_steps(self, max_train_steps: int):
         if not self.enabled:
             return
 
-        training_segments = self.num_squeezes + (1 if self.train_after_final_squeeze else 0)
+        self.segment_weights = self._build_segment_weights()
+        training_segments = len(self.segment_weights)
         if max_train_steps < training_segments:
             raise ValueError(
                 f"max_train_steps={max_train_steps} is too small for {training_segments} LoRA-Squeeze training segments"
             )
 
-        steps = [math.floor(max_train_steps * i / training_segments) for i in range(1, self.num_squeezes + 1)]
+        total_weight = sum(self.segment_weights)
+        steps = []
+        cumulative_weight = 0.0
+        for i in range(self.num_squeezes):
+            cumulative_weight += self.segment_weights[i]
+            steps.append(math.floor(max_train_steps * cumulative_weight / total_weight))
+
         previous_step = 0
         for step in steps:
             if step <= previous_step:
@@ -335,7 +381,20 @@ class LoRASqueezeSchedule:
                     "Use fewer squeezes or more max_train_steps."
                 )
             previous_step = step
+        if self.train_after_final_squeeze and steps[-1] >= max_train_steps:
+            raise ValueError(
+                "LoRA-Squeeze final segment has zero steps. "
+                "Increase max_train_steps or lora_squeeze_final_segment_ratio."
+            )
+
         self.squeeze_steps = steps
+        self.segment_steps = []
+        previous_step = 0
+        for step in self.squeeze_steps:
+            self.segment_steps.append(step - previous_step)
+            previous_step = step
+        if self.train_after_final_squeeze:
+            self.segment_steps.append(max_train_steps - previous_step)
 
     @property
     def completed_squeezes(self) -> int:
@@ -369,6 +428,15 @@ class LoRASqueezeSchedule:
             f"step {step}: {self.ranks[i]}->{self.ranks[i + 1]}"
             for i, step in enumerate(self.squeeze_steps)
         )
+
+    def step_distribution_text(self) -> str:
+        schedule = self.step_schedule if self.step_schedule is not None else "equal"
+        text = schedule
+        if self.train_after_final_squeeze and self.final_segment_ratio != 1.0:
+            text += f", final_segment_ratio={self.final_segment_ratio:g}"
+        if self.segment_steps:
+            text += "; segment steps: " + " / ".join(str(step) for step in self.segment_steps)
+        return text
 
 
 class NetworkTrainer:
@@ -1403,6 +1471,7 @@ class NetworkTrainer:
         train_dataset_group.set_max_train_steps(args.max_train_steps)
         lora_squeeze_schedule.set_total_steps(args.max_train_steps)
         if lora_squeeze_schedule.enabled:
+            accelerator.print(f"LoRA-Squeeze step distribution: {lora_squeeze_schedule.step_distribution_text()}")
             accelerator.print(f"LoRA-Squeeze step schedule: {lora_squeeze_schedule.step_schedule_text()}")
 
         # lr schedulerを用意する
@@ -1662,8 +1731,12 @@ class NetworkTrainer:
             "ss_lora_squeeze_target_alpha": lora_squeeze_schedule.target_alpha,
             "ss_lora_squeeze_num_squeezes": lora_squeeze_schedule.num_squeezes,
             "ss_lora_squeeze_train_after_final_squeeze": bool(lora_squeeze_schedule.train_after_final_squeeze),
+            "ss_lora_squeeze_step_distribution": lora_squeeze_schedule.step_schedule,
+            "ss_lora_squeeze_final_segment_ratio": lora_squeeze_schedule.final_segment_ratio,
             "ss_lora_squeeze_rank_schedule": json.dumps(lora_squeeze_schedule.ranks),
             "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
+            "ss_lora_squeeze_segment_steps": json.dumps(lora_squeeze_schedule.segment_steps),
+            "ss_lora_squeeze_segment_weights": json.dumps(lora_squeeze_schedule.segment_weights),
             "ss_lora_squeeze_current_dim": lora_squeeze_schedule.current_dim,
             "ss_lora_squeeze_current_alpha": lora_squeeze_schedule.current_alpha,
             "ss_lora_squeeze_completed_squeezes": lora_squeeze_schedule.completed_squeezes,
@@ -1852,6 +1925,8 @@ class NetworkTrainer:
                 "ss_lora_squeeze_current_alpha": lora_squeeze_schedule.current_alpha,
                 "ss_lora_squeeze_completed_squeezes": lora_squeeze_schedule.completed_squeezes,
                 "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
+                "ss_lora_squeeze_segment_steps": json.dumps(lora_squeeze_schedule.segment_steps),
+                "ss_lora_squeeze_segment_weights": json.dumps(lora_squeeze_schedule.segment_weights),
             }
             for key, value in dynamic_values.items():
                 metadata[key] = str(value)
@@ -2515,6 +2590,26 @@ def setup_parser() -> argparse.ArgumentParser:
         "--lora_squeeze_train_after_final_squeeze",
         action="store_true",
         help="continue training for one final segment after squeezing to --network_dim",
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_step_schedule",
+        "--squeeze_step_schedule",
+        type=str,
+        default=None,
+        choices=LoRASqueezeSchedule.STEP_SCHEDULE_CHOICES,
+        help=(
+            "spread LoRA-Squeeze training steps by current rank; omit for equal segments. "
+            "Use inverse modes to give smaller ranks more steps"
+        ),
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_final_segment_ratio",
+        "--squeeze_final_segment_ratio",
+        type=float,
+        default=1.0,
+        help="multiply the final post-squeeze training segment length when --lora_squeeze_train_after_final_squeeze is used",
     )
 
     parser.add_argument(
