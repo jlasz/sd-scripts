@@ -5462,16 +5462,22 @@ def get_dummy_scheduler(optimizer: Optimizer) -> Any:
 # Add some checking and features to the original function.
 
 
-def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
+def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int, training_steps: Optional[int] = None):
     """
     Unified API to get any scheduler from its name.
+
+    training_steps overrides args.max_train_steps for scheduler construction. This
+    is used when one training job contains independent scheduler segments.
     """
     # if schedulefree optimizer, return dummy scheduler
     if is_schedulefree_optimizer(optimizer, args):
         return get_dummy_scheduler(optimizer)
 
     name = args.lr_scheduler
-    num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
+    scheduler_training_steps = args.max_train_steps if training_steps is None else training_steps
+    if scheduler_training_steps <= 0:
+        raise ValueError("training_steps must be greater than 0")
+    num_training_steps = scheduler_training_steps * num_processes  # * args.gradient_accumulation_steps
     num_warmup_steps: Optional[int] = (
         int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )

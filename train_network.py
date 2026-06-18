@@ -400,6 +400,16 @@ class LoRASqueezeSchedule:
     def completed_squeezes(self) -> int:
         return self.next_squeeze_index
 
+    @property
+    def current_segment_steps(self) -> Optional[int]:
+        if not self.enabled or not self.segment_steps or self.next_squeeze_index >= len(self.segment_steps):
+            return None
+        return self.segment_steps[self.next_squeeze_index]
+
+    @property
+    def total_segments(self) -> int:
+        return len(self.segment_steps)
+
     def next_due(self, global_step: int) -> Optional[Dict[str, Union[int, float]]]:
         if not self.enabled or self.next_squeeze_index >= self.num_squeezes:
             return None
@@ -1475,7 +1485,15 @@ class NetworkTrainer:
             accelerator.print(f"LoRA-Squeeze step schedule: {lora_squeeze_schedule.step_schedule_text()}")
 
         # lr schedulerを用意する
-        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        scheduler_training_steps = lora_squeeze_schedule.current_segment_steps if lora_squeeze_schedule.enabled else None
+        lr_scheduler = train_util.get_scheduler_fix(
+            args, optimizer, accelerator.num_processes, training_steps=scheduler_training_steps
+        )
+        if lora_squeeze_schedule.enabled:
+            accelerator.print(
+                "LoRA-Squeeze scheduler: independent cycle per rank segment; "
+                f"segment 1/{lora_squeeze_schedule.total_segments}, steps={scheduler_training_steps}"
+            )
 
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
@@ -1737,6 +1755,8 @@ class NetworkTrainer:
             "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
             "ss_lora_squeeze_segment_steps": json.dumps(lora_squeeze_schedule.segment_steps),
             "ss_lora_squeeze_segment_weights": json.dumps(lora_squeeze_schedule.segment_weights),
+            "ss_lora_squeeze_scheduler_mode": "independent_per_segment" if lora_squeeze_schedule.enabled else None,
+            "ss_lora_squeeze_current_segment_steps": lora_squeeze_schedule.current_segment_steps,
             "ss_lora_squeeze_current_dim": lora_squeeze_schedule.current_dim,
             "ss_lora_squeeze_current_alpha": lora_squeeze_schedule.current_alpha,
             "ss_lora_squeeze_completed_squeezes": lora_squeeze_schedule.completed_squeezes,
@@ -1927,6 +1947,7 @@ class NetworkTrainer:
                 "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
                 "ss_lora_squeeze_segment_steps": json.dumps(lora_squeeze_schedule.segment_steps),
                 "ss_lora_squeeze_segment_weights": json.dumps(lora_squeeze_schedule.segment_weights),
+                "ss_lora_squeeze_current_segment_steps": lora_squeeze_schedule.current_segment_steps,
             }
             for key, value in dynamic_values.items():
                 metadata[key] = str(value)
@@ -1999,8 +2020,12 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
-        def rebuild_optimizer_for_current_network(sync_scheduler_to_step: int):
+        def rebuild_optimizer_for_current_network():
             nonlocal optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn, lr_scheduler, lr_descriptions
+
+            segment_steps = lora_squeeze_schedule.current_segment_steps
+            if segment_steps is None:
+                return
 
             old_optimizer = optimizer
             old_lr_scheduler = lr_scheduler
@@ -2026,12 +2051,18 @@ class NetworkTrainer:
                 train_util.tag_adv_optm_trainable_parameters(unwrapped_network)
 
             optimizer_name, optimizer_args, new_optimizer = train_util.get_optimizer(args, trainable_params)
-            new_lr_scheduler = train_util.get_scheduler_fix(args, new_optimizer, accelerator.num_processes)
+            new_lr_scheduler = train_util.get_scheduler_fix(
+                args, new_optimizer, accelerator.num_processes, training_steps=segment_steps
+            )
             optimizer, lr_scheduler = accelerator.prepare(new_optimizer, new_lr_scheduler)
-            for _ in range(sync_scheduler_to_step):
-                lr_scheduler.step()
             optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
             optimizer_train_fn()
+
+            accelerator.print(
+                "LoRA-Squeeze scheduler restarted: "
+                f"segment {lora_squeeze_schedule.completed_squeezes + 1}/{lora_squeeze_schedule.total_segments}, "
+                f"rank={lora_squeeze_schedule.current_dim}, steps={segment_steps}"
+            )
 
             raw_old_optimizer = getattr(old_optimizer, "optimizer", old_optimizer)
             if hasattr(raw_old_optimizer, "state"):
@@ -2062,7 +2093,7 @@ class NetworkTrainer:
                 f"retained_energy_mean={stats['retained_energy_mean']:.6f}"
             )
 
-            rebuild_optimizer_for_current_network(global_step)
+            rebuild_optimizer_for_current_network()
             clean_memory_on_device(accelerator.device)
 
         # function for saving/removing
