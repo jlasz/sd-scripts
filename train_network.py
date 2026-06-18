@@ -449,6 +449,14 @@ class LoRASqueezeSchedule:
         return text
 
 
+def resolve_total_rms_check_interval(target_total_rms: Optional[float], check_every_n_steps: Optional[int]) -> int:
+    if check_every_n_steps is None:
+        return 25 if target_total_rms is not None else 0
+    if check_every_n_steps < 0:
+        raise ValueError("--total_rms_check_every_n_steps must be 0 or greater")
+    return check_every_n_steps
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -1141,6 +1149,10 @@ class NetworkTrainer:
         train_util.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+
+        args.total_rms_check_every_n_steps = resolve_total_rms_check_interval(
+            args.target_total_rms, args.total_rms_check_every_n_steps
+        )
 
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
@@ -2297,18 +2309,20 @@ class NetworkTrainer:
                     weight_value_tracker.record(global_step, current_epoch.value)
 
                     if (
-                        args.target_total_rms is not None
-                        and args.total_rms_check_every_n_steps > 0
+                        args.total_rms_check_every_n_steps > 0
                         and global_step % args.total_rms_check_every_n_steps == 0
                     ):
                         total_rms = self.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
                         last_total_rms = total_rms
 
-                        accelerator.print(
-                            f"total_rms={total_rms:.8g}, target_total_rms={args.target_total_rms:.8g}"
-                        )
+                        if args.target_total_rms is None:
+                            accelerator.print(f"total_rms={total_rms:.8g}")
+                        else:
+                            accelerator.print(
+                                f"total_rms={total_rms:.8g}, target_total_rms={args.target_total_rms:.8g}"
+                            )
 
-                        if total_rms >= args.target_total_rms:
+                        if args.target_total_rms is not None and total_rms >= args.target_total_rms:
                             accelerator.print(
                                 f"target_total_rms reached: {total_rms:.8g} >= {args.target_total_rms:.8g}"
                             )
@@ -2598,8 +2612,11 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--total_rms_check_every_n_steps",
         type=int,
-        default=25,
-        help="check total scaled adapter RMS every N optimizer steps",
+        default=None,
+        help=(
+            "log total scaled adapter RMS every N optimizer steps; omit to disable unless "
+            "--target_total_rms is set, in which case the default interval is 25. Set 0 to disable"
+        ),
     )
 
     parser.add_argument(
