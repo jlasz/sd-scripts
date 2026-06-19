@@ -253,6 +253,10 @@ class WeightValueTracker:
 
 
 class LoRASqueezeSchedule:
+    RANK_SCHEDULE_CHOICES = (
+        "linear",
+        "geometric",
+    )
     STEP_SCHEDULE_CHOICES = (
         "rank_proportional",
         "sqrt_rank_proportional",
@@ -273,6 +277,9 @@ class LoRASqueezeSchedule:
         self.target_alpha = args.network_alpha
         self.num_squeezes = num_squeezes
         self.train_after_final_squeeze = args.lora_squeeze_train_after_final_squeeze
+        self.rank_schedule = getattr(args, "lora_squeeze_rank_schedule", "linear")
+        if self.rank_schedule is None:
+            self.rank_schedule = "linear"
         self.step_schedule = getattr(args, "lora_squeeze_step_schedule", None)
         self.final_segment_ratio = getattr(args, "lora_squeeze_final_segment_ratio", 1.0)
         if self.final_segment_ratio is None:
@@ -302,6 +309,10 @@ class LoRASqueezeSchedule:
             raise ValueError("--network_dim must be greater than 0 when LoRA-Squeeze is enabled")
         if self.target_alpha <= 0:
             raise ValueError("--network_alpha must be greater than 0 when LoRA-Squeeze is enabled")
+        if self.rank_schedule not in self.RANK_SCHEDULE_CHOICES:
+            raise ValueError(
+                "--lora_squeeze_rank_schedule must be one of: " + ", ".join(self.RANK_SCHEDULE_CHOICES)
+            )
         if self.step_schedule is not None and self.step_schedule not in self.STEP_SCHEDULE_CHOICES:
             raise ValueError(
                 "--lora_squeeze_step_schedule must be one of: " + ", ".join(self.STEP_SCHEDULE_CHOICES)
@@ -319,6 +330,16 @@ class LoRASqueezeSchedule:
         for i in range(1, self.num_squeezes + 1):
             if i == self.num_squeezes:
                 rank = self.target_dim
+            elif self.rank_schedule == "geometric":
+                progress = i / self.num_squeezes
+                ideal_rank = self.start_dim * math.pow(self.target_dim / self.start_dim, progress)
+                rank = math.floor(ideal_rank + 0.5)
+
+                # Integer rounding can repeat a rank, especially when the range is tight. Clamp the
+                # candidate to leave one distinct integer rank for every remaining squeeze.
+                minimum_rank = self.target_dim + self.num_squeezes - i
+                maximum_rank = ranks[-1] - 1
+                rank = min(max(rank, minimum_rank), maximum_rank)
             else:
                 rank = math.floor(self.start_dim - rank_delta * i / self.num_squeezes)
 
@@ -1761,6 +1782,7 @@ class NetworkTrainer:
             "ss_lora_squeeze_target_alpha": lora_squeeze_schedule.target_alpha,
             "ss_lora_squeeze_num_squeezes": lora_squeeze_schedule.num_squeezes,
             "ss_lora_squeeze_train_after_final_squeeze": bool(lora_squeeze_schedule.train_after_final_squeeze),
+            "ss_lora_squeeze_rank_distribution": lora_squeeze_schedule.rank_schedule,
             "ss_lora_squeeze_step_distribution": lora_squeeze_schedule.step_schedule,
             "ss_lora_squeeze_final_segment_ratio": lora_squeeze_schedule.final_segment_ratio,
             "ss_lora_squeeze_rank_schedule": json.dumps(lora_squeeze_schedule.ranks),
@@ -2638,6 +2660,17 @@ def setup_parser() -> argparse.ArgumentParser:
         "--lora_squeeze_train_after_final_squeeze",
         action="store_true",
         help="continue training for one final segment after squeezing to --network_dim",
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_rank_schedule",
+        type=str,
+        default="linear",
+        choices=LoRASqueezeSchedule.RANK_SCHEDULE_CHOICES,
+        help=(
+            "choose how intermediate LoRA-Squeeze ranks are spaced; linear uses equal rank differences, "
+            "geometric uses approximately equal compression ratios"
+        ),
     )
 
     parser.add_argument(
