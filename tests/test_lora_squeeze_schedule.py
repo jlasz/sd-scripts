@@ -51,6 +51,24 @@ class LoRASqueezeScheduleTest(unittest.TestCase):
 
         self.assertEqual(schedule.ranks, [13, 12, 11, 10, 9])
 
+    def test_explicit_equal_step_schedule_matches_omitted_schedule(self):
+        omitted = make_schedule(lora_squeeze_final_segment_ratio=1.5)
+        explicit = make_schedule(
+            lora_squeeze_step_schedule="equal",
+            lora_squeeze_final_segment_ratio=1.5,
+        )
+
+        omitted.set_total_steps(5000)
+        explicit.set_total_steps(5000)
+
+        self.assertEqual(explicit.segment_weights, omitted.segment_weights)
+        self.assertEqual(explicit.squeeze_steps, omitted.squeeze_steps)
+        self.assertEqual(explicit.segment_steps, omitted.segment_steps)
+        self.assertEqual(
+            explicit.step_distribution_text(),
+            "equal, final_segment_ratio=1.5; segment steps: 909 / 909 / 909 / 909 / 1364",
+        )
+
     def test_invalid_rank_schedule_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "--lora_squeeze_rank_schedule must be one of"):
             make_schedule(lora_squeeze_rank_schedule="quadratic")

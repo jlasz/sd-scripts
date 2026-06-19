@@ -258,6 +258,7 @@ class LoRASqueezeSchedule:
         "geometric",
     )
     STEP_SCHEDULE_CHOICES = (
+        "equal",
         "rank_proportional",
         "sqrt_rank_proportional",
         "inverse_rank_proportional",
@@ -357,7 +358,7 @@ class LoRASqueezeSchedule:
         return float(self.target_alpha / math.sqrt(self.target_dim) * math.sqrt(rank))
 
     def _weight_for_rank(self, rank: int) -> float:
-        if self.step_schedule is None:
+        if self.step_schedule is None or self.step_schedule == "equal":
             return 1.0
         if self.step_schedule == "rank_proportional":
             return float(rank)
@@ -2680,7 +2681,7 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         choices=LoRASqueezeSchedule.STEP_SCHEDULE_CHOICES,
         help=(
-            "spread LoRA-Squeeze training steps by current rank; omit for equal segments. "
+            "spread LoRA-Squeeze training steps by current rank; use equal or omit for equal segments. "
             "Use inverse modes to give smaller ranks more steps"
         ),
     )
