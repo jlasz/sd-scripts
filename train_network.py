@@ -5,7 +5,7 @@ import csv
 import math
 import os
 import typing
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import sys
 import random
 import time
@@ -264,6 +264,7 @@ class LoRASqueezeSchedule:
         "inverse_rank_proportional",
         "inverse_sqrt_rank_proportional",
     )
+    OPTIMIZER_SCHEDULER_MODE_CHOICES = ("per_squeeze", "global")
 
     def __init__(self, args: argparse.Namespace):
         start_dim = args.lora_squeeze_start_dim
@@ -282,6 +283,9 @@ class LoRASqueezeSchedule:
         if self.rank_schedule is None:
             self.rank_schedule = "linear"
         self.step_schedule = getattr(args, "lora_squeeze_step_schedule", None)
+        self.optimizer_scheduler_mode = getattr(args, "lora_squeeze_optimizer_scheduler_mode", "per_squeeze")
+        if self.optimizer_scheduler_mode is None:
+            self.optimizer_scheduler_mode = "per_squeeze"
         self.final_segment_ratio = getattr(args, "lora_squeeze_final_segment_ratio", 1.0)
         if self.final_segment_ratio is None:
             self.final_segment_ratio = 1.0
@@ -317,6 +321,11 @@ class LoRASqueezeSchedule:
         if self.step_schedule is not None and self.step_schedule not in self.STEP_SCHEDULE_CHOICES:
             raise ValueError(
                 "--lora_squeeze_step_schedule must be one of: " + ", ".join(self.STEP_SCHEDULE_CHOICES)
+            )
+        if self.optimizer_scheduler_mode not in self.OPTIMIZER_SCHEDULER_MODE_CHOICES:
+            raise ValueError(
+                "--lora_squeeze_optimizer_scheduler_mode must be one of: "
+                + ", ".join(self.OPTIMIZER_SCHEDULER_MODE_CHOICES)
             )
         if self.final_segment_ratio <= 0:
             raise ValueError("--lora_squeeze_final_segment_ratio must be greater than 0")
@@ -528,7 +537,14 @@ class NetworkTrainer:
         raise ValueError(f"LoRA-Squeeze does not support mixed LoRA layer types: {module.lora_name}")
 
     @staticmethod
-    def compact_lora_product(up_2d: torch.Tensor, down_2d: torch.Tensor, old_scale: float, target_dim: int):
+    def compact_lora_product(
+        up_2d: torch.Tensor,
+        down_2d: torch.Tensor,
+        old_scale: float,
+        target_dim: int,
+        target_alpha: float,
+        build_optimizer_projections: bool = False,
+    ):
         # SVD of (up @ down * old_scale) through the rank-sized core.
         a = up_2d
         b = down_2d * old_scale
@@ -538,9 +554,79 @@ class NetworkTrainer:
         u_core, singular_values, vh_core = torch.linalg.svd(core, full_matrices=False)
 
         usable_dim = min(target_dim, singular_values.numel())
-        u = qa @ u_core[:, :usable_dim]
-        vh = vh_core[:usable_dim, :] @ qb.T
-        return u, singular_values, vh
+        kept = singular_values[:usable_dim].clamp_min(0)
+        factor_scale = math.sqrt(target_dim / target_alpha)
+        sqrt_s = torch.sqrt(kept)
+
+        new_up_core = torch.zeros((ra.shape[0], target_dim), device=ra.device, dtype=ra.dtype)
+        new_down_core = torch.zeros((target_dim, rb.shape[0]), device=rb.device, dtype=rb.dtype)
+        if usable_dim > 0:
+            new_up_core[:, :usable_dim] = u_core[:, :usable_dim] * sqrt_s.unsqueeze(0) * factor_scale
+            new_down_core[:usable_dim, :] = sqrt_s.unsqueeze(1) * vh_core[:usable_dim, :] * factor_scale
+
+        new_up_2d = qa @ new_up_core
+        new_down_2d = new_down_core @ qb.T
+
+        up_grad_projection = None
+        down_grad_projection = None
+        if build_optimizer_projections:
+            new_scale = target_alpha / target_dim
+            # Adam moments live in gradient coordinates. The first-moment transforms follow
+            # the chain rule; squared coefficients approximate diagonal second moments.
+            up_grad_projection = new_scale * torch.linalg.pinv(rb) @ new_down_core.T
+            down_grad_projection = (new_scale / old_scale) * (torch.linalg.pinv(ra) @ new_up_core).T
+            if not torch.isfinite(up_grad_projection).all() or not torch.isfinite(down_grad_projection).all():
+                raise ValueError("LoRA-Squeeze optimizer-state projection produced non-finite values")
+
+        return new_up_2d, singular_values, new_down_2d, up_grad_projection, down_grad_projection
+
+    @staticmethod
+    def _optimizer_state_tensor_to_2d(tensor: torch.Tensor, role: str) -> torch.Tensor:
+        if tensor.ndim == 2:
+            return tensor
+        if tensor.ndim >= 3:
+            return tensor.reshape(tensor.shape[0], -1)
+        if tensor.ndim == 1:
+            return tensor.reshape(1, -1) if role == "down" else tensor.reshape(-1, 1)
+        raise ValueError(f"Unsupported Adam state tensor rank for LoRA-Squeeze: {tensor.ndim}")
+
+    @staticmethod
+    def project_adam_optimizer_state(
+        state: Dict[str, Any],
+        projection: torch.Tensor,
+        role: str,
+        target_shape: torch.Size,
+    ) -> Dict[str, Any]:
+        projected_state: Dict[str, Any] = {}
+        moment_keys = {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}
+
+        for key, value in state.items():
+            if key not in moment_keys:
+                if isinstance(value, torch.Tensor):
+                    if value.numel() != 1:
+                        raise ValueError(f"Unsupported Adam state tensor for global LoRA-Squeeze: {key}")
+                    projected_state[key] = value.detach().clone()
+                else:
+                    projected_state[key] = value
+                continue
+
+            state_2d = NetworkTrainer._optimizer_state_tensor_to_2d(value.detach().float(), role)
+            state_projection = projection.detach().to(device=state_2d.device, dtype=state_2d.dtype)
+            if key != "exp_avg":
+                state_projection = state_projection.square()
+
+            if role == "up":
+                projected = state_2d @ state_projection
+            elif role == "down":
+                projected = state_projection @ state_2d
+            else:
+                raise ValueError(f"Unknown LoRA optimizer-state role: {role}")
+
+            if key != "exp_avg":
+                projected = projected.clamp_min(0.0)
+            projected_state[key] = projected.reshape(target_shape).to(device=value.device, dtype=value.dtype)
+
+        return projected_state
 
     @staticmethod
     def replace_lora_module_layers(
@@ -612,7 +698,13 @@ class NetworkTrainer:
         else:
             module.register_buffer("alpha", alpha_tensor)
 
-    def squeeze_lora_network(self, network: torch.nn.Module, target_dim: int, target_alpha: float) -> Dict[str, float]:
+    def squeeze_lora_network(
+        self,
+        network: torch.nn.Module,
+        target_dim: int,
+        target_alpha: float,
+        optimizer_for_state_transfer: Optional[torch.optim.Optimizer] = None,
+    ) -> Tuple[Dict[str, float], List[Tuple[torch.nn.Parameter, Dict[str, Any]]]]:
         lora_modules = self.get_lora_squeeze_modules(network)
         if len(lora_modules) == 0:
             raise ValueError("LoRA-Squeeze did not find any LoRA modules with lora_down/lora_up weights")
@@ -625,45 +717,58 @@ class NetworkTrainer:
             raise ValueError(f"LoRA-Squeeze target rank {target_dim} must be less than current rank {source_rank}")
 
         retained_energies: List[float] = []
+        optimizer_state_transfers: List[Tuple[torch.nn.Parameter, Dict[str, Any]]] = []
         with torch.no_grad():
             for module in lora_modules:
                 old_rank = self.get_lora_module_rank(module)
                 old_alpha = self.get_lora_module_alpha(module)
                 old_scale = old_alpha / old_rank
                 up_2d, down_2d, kind = self.get_lora_factor_matrices(module)
+                old_up_parameter = module.lora_up.weight
+                old_down_parameter = module.lora_down.weight
 
-                u, singular_values, vh = self.compact_lora_product(up_2d, down_2d, old_scale, target_dim)
+                new_up_2d, singular_values, new_down_2d, up_projection, down_projection = self.compact_lora_product(
+                    up_2d,
+                    down_2d,
+                    old_scale,
+                    target_dim,
+                    target_alpha,
+                    build_optimizer_projections=optimizer_for_state_transfer is not None,
+                )
                 usable_dim = min(target_dim, singular_values.numel())
                 kept = singular_values[:usable_dim].clamp_min(0)
                 total_energy = torch.sum(singular_values * singular_values).item()
                 kept_energy = torch.sum(kept * kept).item()
                 retained_energies.append(1.0 if total_energy == 0.0 else kept_energy / total_energy)
 
-                factor_scale = math.sqrt(target_dim / target_alpha)
-                sqrt_s = torch.sqrt(kept)
-                new_up_2d = torch.zeros(
-                    (up_2d.shape[0], target_dim),
-                    device=up_2d.device,
-                    dtype=up_2d.dtype,
-                )
-                new_down_2d = torch.zeros(
-                    (target_dim, down_2d.shape[1]),
-                    device=down_2d.device,
-                    dtype=down_2d.dtype,
-                )
-                if usable_dim > 0:
-                    new_up_2d[:, :usable_dim] = u[:, :usable_dim] * sqrt_s.unsqueeze(0) * factor_scale
-                    new_down_2d[:usable_dim, :] = sqrt_s.unsqueeze(1) * vh[:usable_dim, :] * factor_scale
-
                 self.replace_lora_module_layers(module, new_up_2d, new_down_2d, target_dim, target_alpha, kind)
 
-        return {
-            "modules": float(len(lora_modules)),
-            "source_rank": float(source_rank),
-            "target_rank": float(target_dim),
-            "retained_energy_min": min(retained_energies),
-            "retained_energy_mean": sum(retained_energies) / len(retained_energies),
-        }
+                if optimizer_for_state_transfer is not None:
+                    new_up_state = self.project_adam_optimizer_state(
+                        optimizer_for_state_transfer.state.get(old_up_parameter, {}),
+                        up_projection,
+                        "up",
+                        module.lora_up.weight.shape,
+                    )
+                    new_down_state = self.project_adam_optimizer_state(
+                        optimizer_for_state_transfer.state.get(old_down_parameter, {}),
+                        down_projection,
+                        "down",
+                        module.lora_down.weight.shape,
+                    )
+                    optimizer_state_transfers.append((module.lora_up.weight, new_up_state))
+                    optimizer_state_transfers.append((module.lora_down.weight, new_down_state))
+
+        return (
+            {
+                "modules": float(len(lora_modules)),
+                "source_rank": float(source_rank),
+                "target_rank": float(target_dim),
+                "retained_energy_min": min(retained_energies),
+                "retained_energy_mean": sum(retained_energies) / len(retained_energies),
+            },
+            optimizer_state_transfers,
+        )
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -1472,6 +1577,15 @@ class NetworkTrainer:
                 accelerator.print(f"tagged trainable parameters for adv_optm scaling: {tag_text}")
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
+        if (
+            lora_squeeze_schedule.enabled
+            and lora_squeeze_schedule.optimizer_scheduler_mode == "global"
+            and not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+        ):
+            raise ValueError(
+                "global LoRA-Squeeze optimizer/scheduler mode currently supports only torch Adam and AdamW; "
+                f"got {type(optimizer).__module__}.{type(optimizer).__name__}"
+            )
         optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
 
         # prepare dataloader
@@ -1519,15 +1633,23 @@ class NetworkTrainer:
             accelerator.print(f"LoRA-Squeeze step schedule: {lora_squeeze_schedule.step_schedule_text()}")
 
         # lr schedulerを用意する
-        scheduler_training_steps = lora_squeeze_schedule.current_segment_steps if lora_squeeze_schedule.enabled else None
+        scheduler_training_steps = None
+        if lora_squeeze_schedule.enabled and lora_squeeze_schedule.optimizer_scheduler_mode == "per_squeeze":
+            scheduler_training_steps = lora_squeeze_schedule.current_segment_steps
         lr_scheduler = train_util.get_scheduler_fix(
             args, optimizer, accelerator.num_processes, training_steps=scheduler_training_steps
         )
         if lora_squeeze_schedule.enabled:
-            accelerator.print(
-                "LoRA-Squeeze scheduler: independent cycle per rank segment; "
-                f"segment 1/{lora_squeeze_schedule.total_segments}, steps={scheduler_training_steps}"
-            )
+            if lora_squeeze_schedule.optimizer_scheduler_mode == "per_squeeze":
+                accelerator.print(
+                    "LoRA-Squeeze optimizer/scheduler mode: per_squeeze; "
+                    f"segment 1/{lora_squeeze_schedule.total_segments}, steps={scheduler_training_steps}"
+                )
+            else:
+                accelerator.print(
+                    "LoRA-Squeeze optimizer/scheduler mode: global; Adam moments will be projected at squeezes "
+                    "and the scheduler will continue on the global training curve"
+                )
 
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
@@ -1783,6 +1905,7 @@ class NetworkTrainer:
             "ss_lora_squeeze_target_alpha": lora_squeeze_schedule.target_alpha,
             "ss_lora_squeeze_num_squeezes": lora_squeeze_schedule.num_squeezes,
             "ss_lora_squeeze_train_after_final_squeeze": bool(lora_squeeze_schedule.train_after_final_squeeze),
+            "ss_lora_squeeze_optimizer_scheduler_mode": lora_squeeze_schedule.optimizer_scheduler_mode,
             "ss_lora_squeeze_rank_distribution": lora_squeeze_schedule.rank_schedule,
             "ss_lora_squeeze_step_distribution": lora_squeeze_schedule.step_schedule,
             "ss_lora_squeeze_final_segment_ratio": lora_squeeze_schedule.final_segment_ratio,
@@ -1790,7 +1913,9 @@ class NetworkTrainer:
             "ss_lora_squeeze_step_schedule": json.dumps(lora_squeeze_schedule.squeeze_steps),
             "ss_lora_squeeze_segment_steps": json.dumps(lora_squeeze_schedule.segment_steps),
             "ss_lora_squeeze_segment_weights": json.dumps(lora_squeeze_schedule.segment_weights),
-            "ss_lora_squeeze_scheduler_mode": "independent_per_segment" if lora_squeeze_schedule.enabled else None,
+            "ss_lora_squeeze_scheduler_mode": (
+                lora_squeeze_schedule.optimizer_scheduler_mode if lora_squeeze_schedule.enabled else None
+            ),
             "ss_lora_squeeze_current_segment_steps": lora_squeeze_schedule.current_segment_steps,
             "ss_lora_squeeze_current_dim": lora_squeeze_schedule.current_dim,
             "ss_lora_squeeze_current_alpha": lora_squeeze_schedule.current_alpha,
@@ -2055,7 +2180,9 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
-        def rebuild_optimizer_for_current_network():
+        def rebuild_optimizer_for_current_network(
+            optimizer_state_transfers: List[Tuple[torch.nn.Parameter, Dict[str, Any]]],
+        ):
             nonlocal optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn, lr_scheduler, lr_descriptions
 
             segment_steps = lora_squeeze_schedule.current_segment_steps
@@ -2064,6 +2191,10 @@ class NetworkTrainer:
 
             old_optimizer = optimizer
             old_lr_scheduler = lr_scheduler
+            raw_old_optimizer = getattr(old_optimizer, "optimizer", old_optimizer)
+            global_state_mode = lora_squeeze_schedule.optimizer_scheduler_mode == "global"
+            old_scheduler_state = old_lr_scheduler.state_dict() if global_state_mode else None
+            old_group_lrs = [group["lr"] for group in raw_old_optimizer.param_groups] if global_state_mode else None
             unwrapped_network = accelerator.unwrap_model(network)
             try:
                 if support_multiple_lrs:
@@ -2086,20 +2217,36 @@ class NetworkTrainer:
                 train_util.tag_adv_optm_trainable_parameters(unwrapped_network)
 
             optimizer_name, optimizer_args, new_optimizer = train_util.get_optimizer(args, trainable_params)
-            new_lr_scheduler = train_util.get_scheduler_fix(
-                args, new_optimizer, accelerator.num_processes, training_steps=segment_steps
-            )
+            if global_state_mode:
+                for parameter, state in optimizer_state_transfers:
+                    if state:
+                        new_optimizer.state[parameter] = state
+                new_lr_scheduler = train_util.get_scheduler_fix(args, new_optimizer, accelerator.num_processes)
+                new_lr_scheduler.load_state_dict(old_scheduler_state)
+                if len(new_optimizer.param_groups) != len(old_group_lrs):
+                    raise ValueError("LoRA-Squeeze global mode changed the optimizer parameter-group count")
+                for group, lr in zip(new_optimizer.param_groups, old_group_lrs):
+                    group["lr"] = lr
+            else:
+                new_lr_scheduler = train_util.get_scheduler_fix(
+                    args, new_optimizer, accelerator.num_processes, training_steps=segment_steps
+                )
             optimizer, lr_scheduler = accelerator.prepare(new_optimizer, new_lr_scheduler)
             optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
             optimizer_train_fn()
 
-            accelerator.print(
-                "LoRA-Squeeze scheduler restarted: "
-                f"segment {lora_squeeze_schedule.completed_squeezes + 1}/{lora_squeeze_schedule.total_segments}, "
-                f"rank={lora_squeeze_schedule.current_dim}, steps={segment_steps}"
-            )
+            if global_state_mode:
+                accelerator.print(
+                    "LoRA-Squeeze optimizer/scheduler continued globally: "
+                    f"rank={lora_squeeze_schedule.current_dim}, projected_states={len(optimizer_state_transfers)}"
+                )
+            else:
+                accelerator.print(
+                    "LoRA-Squeeze optimizer/scheduler restarted: "
+                    f"segment {lora_squeeze_schedule.completed_squeezes + 1}/{lora_squeeze_schedule.total_segments}, "
+                    f"rank={lora_squeeze_schedule.current_dim}, steps={segment_steps}"
+                )
 
-            raw_old_optimizer = getattr(old_optimizer, "optimizer", old_optimizer)
             if hasattr(raw_old_optimizer, "state"):
                 raw_old_optimizer.state.clear()
             if hasattr(accelerator, "_optimizers"):
@@ -2116,7 +2263,16 @@ class NetworkTrainer:
             target_alpha = float(event["alpha"])
             unwrapped_network = accelerator.unwrap_model(network)
             accelerator.wait_for_everyone()
-            stats = self.squeeze_lora_network(unwrapped_network, target_dim, target_alpha)
+            raw_optimizer = getattr(optimizer, "optimizer", optimizer)
+            optimizer_for_state_transfer = (
+                raw_optimizer if lora_squeeze_schedule.optimizer_scheduler_mode == "global" else None
+            )
+            stats, optimizer_state_transfers = self.squeeze_lora_network(
+                unwrapped_network,
+                target_dim,
+                target_alpha,
+                optimizer_for_state_transfer=optimizer_for_state_transfer,
+            )
             lora_squeeze_schedule.mark_squeezed(target_dim, target_alpha)
             update_lora_squeeze_metadata()
             unwrapped_network.prepare_grad_etc(text_encoder, unet)
@@ -2128,7 +2284,7 @@ class NetworkTrainer:
                 f"retained_energy_mean={stats['retained_energy_mean']:.6f}"
             )
 
-            rebuild_optimizer_for_current_network()
+            rebuild_optimizer_for_current_network(optimizer_state_transfers)
             clean_memory_on_device(accelerator.device)
 
         # function for saving/removing
@@ -2661,6 +2817,17 @@ def setup_parser() -> argparse.ArgumentParser:
         "--lora_squeeze_train_after_final_squeeze",
         action="store_true",
         help="continue training for one final segment after squeezing to --network_dim",
+    )
+
+    parser.add_argument(
+        "--lora_squeeze_optimizer_scheduler_mode",
+        type=str,
+        default="per_squeeze",
+        choices=LoRASqueezeSchedule.OPTIMIZER_SCHEDULER_MODE_CHOICES,
+        help=(
+            "choose optimizer/scheduler continuity across squeezes: per_squeeze resets both for each rank segment; "
+            "global projects Adam/AdamW moments and continues one global scheduler curve"
+        ),
     )
 
     parser.add_argument(
