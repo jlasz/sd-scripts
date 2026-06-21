@@ -1,6 +1,7 @@
 import gc
 import importlib
 import argparse
+import copy
 import csv
 import math
 import os
@@ -27,6 +28,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+from library.rms_step_probe import build_rms_probe_args, estimate_rms_adjusted_steps, validate_rms_probe_configuration
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
@@ -1270,6 +1272,77 @@ class NetworkTrainer:
         return True  # default for other than HunyuanImage
 
     def train(self, args):
+        if not validate_rms_probe_configuration(args):
+            return self._train(args)
+
+        original_args = copy.deepcopy(args)
+        if original_args.seed is None:
+            original_args.seed = random.randint(0, 2**32)
+        original_steps = original_args.max_train_steps
+        probe_args = build_rms_probe_args(original_args)
+
+        logger.info(
+            "starting isolated RMS probe: steps=%s, reference_rms=%.8g, production_steps=%s, output_dir=%s",
+            probe_args.rms_probe_steps,
+            probe_args.rms_probe_target,
+            original_steps,
+            probe_args.output_dir,
+        )
+        probe_trainer = type(self)()
+        probe_result = probe_trainer._train(probe_args)
+        observed_rms = probe_result["total_rms"]
+        adjusted_steps, step_multiplier = estimate_rms_adjusted_steps(
+            original_steps,
+            original_args.rms_probe_target,
+            observed_rms,
+        )
+
+        summary = {
+            "seed": original_args.seed,
+            "probe_steps": original_args.rms_probe_steps,
+            "target_rms": original_args.rms_probe_target,
+            "observed_rms": observed_rms,
+            "step_multiplier": step_multiplier,
+            "original_max_train_steps": original_steps,
+            "adjusted_max_train_steps": adjusted_steps,
+        }
+        if probe_result["is_main_process"]:
+            os.makedirs(probe_args.output_dir, exist_ok=True)
+            summary_path = os.path.join(probe_args.output_dir, "rms_probe_result.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            logger.info("saved RMS probe result to %s", summary_path)
+
+        logger.info(
+            "RMS probe complete: observed=%.8g, target=%.8g, multiplier=%.8g; "
+            "adjusting max_train_steps from %s to %s",
+            observed_rms,
+            original_args.rms_probe_target,
+            step_multiplier,
+            original_steps,
+            adjusted_steps,
+        )
+
+        # Drop objects retained by the completed probe before loading a fresh model
+        # and constructing a fresh optimizer/scheduler for the production run.
+        del probe_trainer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "xpu") and torch.xpu.is_available() and hasattr(torch.xpu, "empty_cache"):
+            torch.xpu.empty_cache()
+
+        production_args = copy.deepcopy(original_args)
+        production_args.max_train_steps = adjusted_steps
+        production_args._rms_probe_observed = observed_rms
+        production_args._rms_probe_step_multiplier = step_multiplier
+        production_args._rms_probe_original_max_train_steps = original_steps
+        production_args._is_rms_probe_run = False
+
+        logger.info("starting fresh production run with max_train_steps=%s", adjusted_steps)
+        return self._train(production_args)
+
+    def _train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         train_util.verify_training_args(args)
@@ -1626,6 +1699,13 @@ class NetworkTrainer:
             )
 
         # データセット側にも学習ステップを送信
+        training_step_limit = getattr(args, "_training_step_limit", args.max_train_steps)
+        if training_step_limit <= 0 or training_step_limit > args.max_train_steps:
+            raise ValueError(
+                f"internal training step limit must be between 1 and max_train_steps: "
+                f"{training_step_limit} vs {args.max_train_steps}"
+            )
+
         train_dataset_group.set_max_train_steps(args.max_train_steps)
         lora_squeeze_schedule.set_total_steps(args.max_train_steps)
         if lora_squeeze_schedule.enabled:
@@ -1840,6 +1920,9 @@ class NetworkTrainer:
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
+        if training_step_limit != args.max_train_steps:
+            accelerator.print(f"  RMS probe stops after optimization step: {training_step_limit}")
+
         # TODO refactor metadata creation and move to util
         metadata = {
             "ss_session_id": session_id,  # random integer indicating which group of epochs the model came from
@@ -1899,6 +1982,12 @@ class NetworkTrainer:
             "ss_fp8_base_unet": bool(args.fp8_base_unet),
             "ss_target_total_rms": args.target_total_rms,
             "ss_total_rms_check_every_n_steps": args.total_rms_check_every_n_steps,
+            "ss_rms_probe_target": args.rms_probe_target,
+            "ss_rms_probe_steps": args.rms_probe_steps,
+            "ss_rms_probe_observed": getattr(args, "_rms_probe_observed", None),
+            "ss_rms_probe_step_multiplier": getattr(args, "_rms_probe_step_multiplier", None),
+            "ss_rms_probe_original_max_train_steps": getattr(args, "_rms_probe_original_max_train_steps", None),
+            "ss_rms_probe_is_probe_run": bool(getattr(args, "_is_rms_probe_run", False)),
             "ss_lora_squeeze_enabled": bool(lora_squeeze_schedule.enabled),
             "ss_lora_squeeze_start_dim": lora_squeeze_schedule.start_dim,
             "ss_lora_squeeze_target_dim": lora_squeeze_schedule.target_dim,
@@ -2351,7 +2440,10 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(training_step_limit - initial_step),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
 
         validation_steps = (
@@ -2395,7 +2487,9 @@ class NetworkTrainer:
             random.setstate(python_rng_state)
 
         stop_due_to_total_rms = False
+        stop_due_to_step_limit = False
         last_total_rms = None
+        probe_observed_rms = None
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
@@ -2487,10 +2581,14 @@ class NetworkTrainer:
                     global_step += 1
                     weight_value_tracker.record(global_step, current_epoch.value)
 
-                    if (
+                    is_probe_measurement = bool(
+                        getattr(args, "_is_rms_probe_run", False) and global_step == training_step_limit
+                    )
+                    is_periodic_rms_measurement = bool(
                         args.total_rms_check_every_n_steps > 0
                         and global_step % args.total_rms_check_every_n_steps == 0
-                    ):
+                    )
+                    if is_periodic_rms_measurement:
                         total_rms = self.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
                         last_total_rms = total_rms
 
@@ -2508,6 +2606,11 @@ class NetworkTrainer:
                             stop_due_to_total_rms = True
 
                     run_lora_squeeze_if_due(global_step)
+
+                    if is_probe_measurement:
+                        probe_observed_rms = self.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
+                        last_total_rms = probe_observed_rms
+                        accelerator.print(f"rms_probe_observed={probe_observed_rms:.8g}")
 
                     optimizer_eval_fn()
                     self.sample_images(
@@ -2636,7 +2739,9 @@ class NetworkTrainer:
                     accelerator.unwrap_model(network).train()
                     progress_bar.unpause()
 
-                if global_step >= args.max_train_steps or stop_due_to_total_rms:
+                if global_step >= training_step_limit:
+                    stop_due_to_step_limit = True
+                if stop_due_to_step_limit or stop_due_to_total_rms:
                     break
 
             # EPOCH VALIDATION
@@ -2743,7 +2848,7 @@ class NetworkTrainer:
             optimizer_train_fn()
 
             # end of epoch
-            if stop_due_to_total_rms:
+            if stop_due_to_step_limit or stop_due_to_total_rms:
                 break
 
         # metadata["ss_epoch"] = str(num_train_epochs)
@@ -2751,6 +2856,12 @@ class NetworkTrainer:
 
         if is_main_process:
             network = accelerator.unwrap_model(network)
+
+        if getattr(args, "_is_rms_probe_run", False) and probe_observed_rms is None:
+            raise RuntimeError("RMS probe ended without measuring its configured probe step")
+        result_total_rms = probe_observed_rms if probe_observed_rms is not None else last_total_rms
+        if probe_observed_rms is not None:
+            metadata["ss_rms_probe_observed"] = str(probe_observed_rms)
 
         accelerator.end_training()
         optimizer_eval_fn()
@@ -2760,11 +2871,20 @@ class NetworkTrainer:
 
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
-            save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            save_model(ckpt_name, network, global_step, current_epoch.value, force_sync_upload=True)
 
             logger.info("model saved.")
 
+        if getattr(args, "_is_rms_probe_run", False):
+            accelerator.wait_for_everyone()
+
         weight_value_tracker.close()
+
+        return {
+            "global_step": global_step,
+            "total_rms": result_total_rms,
+            "is_main_process": is_main_process,
+        }
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -2796,6 +2916,23 @@ def setup_parser() -> argparse.ArgumentParser:
             "log total scaled adapter RMS every N optimizer steps; omit to disable unless "
             "--target_total_rms is set, in which case the default interval is 25. Set 0 to disable"
         ),
+    )
+
+    parser.add_argument(
+        "--rms_probe_target",
+        type=float,
+        default=None,
+        help=(
+            "reference model's total scaled adapter RMS at --rms_probe_steps; runs an isolated probe, "
+            "then starts fresh training with max_train_steps multiplied by target RMS / observed RMS"
+        ),
+    )
+
+    parser.add_argument(
+        "--rms_probe_steps",
+        type=int,
+        default=None,
+        help="number of optimizer steps in the isolated RMS probe run",
     )
 
     parser.add_argument(
