@@ -649,3 +649,11 @@ class LatentsCachingStrategy:
         if alpha_mask is not None:
             kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
         np.savez(npz_path, **kwargs)
+
+
+def reset_strategies() -> None:
+    """Clear process-global strategies before starting an independent training run."""
+    TokenizeStrategy._strategy = None
+    TextEncodingStrategy._strategy = None
+    TextEncoderOutputsCachingStrategy._strategy = None
+    LatentsCachingStrategy._strategy = None

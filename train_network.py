@@ -1326,6 +1326,7 @@ class NetworkTrainer:
         # Drop objects retained by the completed probe before loading a fresh model
         # and constructing a fresh optimizer/scheduler for the production run.
         del probe_trainer
+        strategy_base.reset_strategies()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
