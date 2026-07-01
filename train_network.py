@@ -753,6 +753,9 @@ class NetworkTrainer:
 
         metadata = {k: str(v) for k, v in metadata.items()}
 
+        if getattr(args, "no_caption_metadata", False):
+            metadata = model_io.remove_caption_metadata(metadata)
+
         # make minimum metadata for filtering
         minimum_metadata = {}
         for key in SS_METADATA_MINIMUM_KEYS:
@@ -2070,6 +2073,11 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no_metadata", action="store_true", help="do not save metadata in output model / メタデータを出力先モデルに保存しない"
+    )
+    parser.add_argument(
+        "--no_caption_metadata",
+        action="store_true",
+        help="omit training caption and tag metadata while preserving all other model metadata",
     )
     parser.add_argument(
         "--save_model_as",

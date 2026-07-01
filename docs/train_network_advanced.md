@@ -37,6 +37,7 @@ Options match `train_network.py`:
 * `--save_state`, `--save_state_on_train_end`: Saves the training state (`state`), including Optimizer status, etc., when saving the model or at the end of training. Required for resuming training with the `--resume` option.
 * `--save_last_n_epochs_state=M`, `--save_last_n_steps_state=M`: Limits the number of saved `state` files to M. Overrides the `--save_last_n_epochs/steps` specification.
 * `--no_metadata`: Does not save metadata to the output model.
+* `--no_caption_metadata`: Omits training caption and tag metadata while preserving all other output-model metadata.
 * `--save_state_to_huggingface` and related options (e.g., `--huggingface_repo_id`): Options related to uploading models and states to Hugging Face Hub. See TODO add document for details.
 
 ### 1.4. Network Parameters (LoRA)

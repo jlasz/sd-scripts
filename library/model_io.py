@@ -179,6 +179,51 @@ SS_METADATA_MINIMUM_KEYS = [
 ]
 
 
+CAPTION_METADATA_KEYS = {
+    "ss_caption_dropout_rate",
+    "ss_caption_dropout_every_n_epochs",
+    "ss_caption_tag_dropout_rate",
+    "ss_shuffle_caption",
+    "ss_keep_tokens",
+    "ss_tag_frequency",
+}
+
+DATASET_CAPTION_METADATA_KEYS = {"tag_frequency"}
+
+SUBSET_CAPTION_METADATA_KEYS = {
+    "shuffle_caption",
+    "keep_tokens",
+    "keep_tokens_separator",
+    "secondary_separator",
+    "enable_wildcard",
+    "caption_prefix",
+    "caption_suffix",
+    "class_tokens",
+}
+
+
+def remove_caption_metadata(metadata: dict) -> dict:
+    """Return model metadata without training caption or tag information."""
+
+    filtered_metadata = metadata.copy()
+    for key in CAPTION_METADATA_KEYS:
+        filtered_metadata.pop(key, None)
+
+    serialized_datasets = filtered_metadata.get("ss_datasets")
+    if serialized_datasets is None:
+        return filtered_metadata
+
+    datasets = json.loads(serialized_datasets)
+    for dataset in datasets:
+        for key in DATASET_CAPTION_METADATA_KEYS:
+            dataset.pop(key, None)
+        for subset in dataset.get("subsets", []):
+            for key in SUBSET_CAPTION_METADATA_KEYS:
+                subset.pop(key, None)
+    filtered_metadata["ss_datasets"] = json.dumps(datasets)
+    return filtered_metadata
+
+
 def build_minimum_network_metadata(
     v2: Optional[str],
     base_model: Optional[str],
