@@ -23,6 +23,11 @@ The shared training utilities (formerly a single large `train_util.py`) are spli
 | `library/args.py` | All `add_*_arguments` parser registrations, `verify_*` validation, `read_config_from_file` |
 | `library/accelerator_setup.py` | `prepare_accelerator`, `prepare_dtype`, `HIGH_VRAM` flag |
 | `library/optimizer.py` | `get_optimizer` dispatcher (AdamW / 8-bit / Lion / DAdaptation / Prodigy / Adafactor / schedule-free), LR schedulers |
+| `library/lora_squeeze_schedule.py` | LoRA-Squeeze schedules, progress budgets, validation, and resume serialization |
+| `library/lora_squeeze_network.py` | LoRA-Squeeze network-facing protocols and standard Linear/Conv2d factor validation/replacement |
+| `library/lora_squeeze_compression.py` | LoRA-Squeeze protocol/network validation, optimizer parameter-layout validation, and SVD compression |
+| `library/lora_squeeze_optimizer.py` | Optimizer-specific LoRA-Squeeze state transformations |
+| `library/lora_squeeze_training.py` | LoRA-Squeeze runtime integration, training budgets, metadata/logging, optimizer/scheduler rebuilding, and Accelerate lifecycle |
 | `library/model_io.py` | Checkpoint loading (`load_target_model`), model hashes, safetensors metadata, SAI model spec |
 | `library/checkpoint_io.py` | Save / rotate checkpoints and train state (`save_sd_model_on_*`, filename templates) |
 | `library/loss.py` | Per-step loss building blocks: timestep sampling, noise, `conditional_loss` |

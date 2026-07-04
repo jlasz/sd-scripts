@@ -143,6 +143,7 @@ Next, we'll explain the main command-line arguments.
   * Specifies the rank (dimension) of LoRA. Higher values increase expressiveness but also increase file size and computational cost. Values between 4 and 128 are commonly used. There is no default (module dependent).
 * `--network_alpha=1`
   * Specifies the alpha value for LoRA. This parameter is related to learning rate scaling. It is generally recommended to set it to about half the value of `network_dim`, but it can also be the same value as `network_dim`. The default is 1. Setting it to the same value as `network_dim` will result in behavior similar to older versions.
+  * To train at a higher rank and progressively compress to `network_dim`, see [LoRA-Squeeze training](./lora_squeeze.md). Check that guide for supported network modules and rank-layout limitations.
 * `--network_args`
   * Used to specify additional parameters specific to the LoRA module. For example, to use Conv2d (3x3) LoRA (LoRA-C3Lier), specify the following in `--network_args`. Use `conv_dim` to specify the rank for Conv2d (3x3) and `conv_alpha` for alpha.
     ```
@@ -231,6 +232,7 @@ Next, we'll explain the main command-line arguments.
     *   LoRA のランク (rank / 次元数) を指定します。値が大きいほど表現力は増しますが、ファイルサイズと計算コストが増加します。一般的には 4〜128 程度の値が使われます。デフォルトは指定されていません（モジュール依存）。
 *   `--network_alpha=1`
     *   LoRA のアルファ値 (alpha) を指定します。学習率のスケーリングに関係するパラメータで、一般的には `network_dim` の半分程度の値を指定することが推奨されますが、`network_dim` と同じ値を指定する場合もあります。デフォルトは 1 です。`network_dim` と同じ値に設定すると、旧バージョンと同様の挙動になります。
+    *   高い rank から学習を開始し、`network_dim` まで段階的に圧縮する方法は [LoRA-Squeeze training](./lora_squeeze.md) を参照してください。対応する network module と rank 構成の制限も確認してください。
 
 * `--network_args`
     *   LoRA モジュールに特有の追加パラメータを指定するために使用します。例えば、Conv2d (3x3) の LoRA  (LoRA-C3Lier) を使用する場合は`--network_args` に以下のように指定してください。`conv_dim` で Conv2d (3x3) の rank を、`conv_alpha` で alpha を指定します。
