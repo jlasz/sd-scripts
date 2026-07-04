@@ -4,7 +4,7 @@ import argparse
 import math
 import os
 import typing
-from typing import Any, List, Literal, Union, Optional
+from typing import Any, Dict, List, Literal, Union, Optional
 import sys
 import random
 import time
@@ -39,6 +39,7 @@ import library.logging_util as logging_util
 import library.loss as loss_util
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
+import library.lora_squeeze_training as lora_squeeze_training
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -82,6 +83,8 @@ class NetworkTrainer:
         maximum_norm=None,
         mean_grad_norm=None,
         mean_combined_norm=None,
+        learning_rates=None,
+        lr_param_groups=None,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
@@ -95,7 +98,7 @@ class NetworkTrainer:
         if mean_combined_norm is not None:
             logs["norm/avg_combined_norm"] = mean_combined_norm
 
-        lrs = lr_scheduler.get_last_lr()
+        lrs = learning_rates if learning_rates is not None else lr_scheduler.get_last_lr()
         for i, lr in enumerate(lrs):
             if lr_descriptions is not None:
                 lr_desc = lr_descriptions[i]
@@ -112,11 +115,15 @@ class NetworkTrainer:
             logs[f"lr/{lr_desc}"] = lr
 
             if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower().startswith("Prodigy".lower()):
-                opt = lr_scheduler.optimizers[-1] if hasattr(lr_scheduler, "optimizers") else optimizer
-                if opt is not None:
-                    logs[f"lr/d*lr/{lr_desc}"] = opt.param_groups[i]["d"] * opt.param_groups[i]["lr"]
-                    if "effective_lr" in opt.param_groups[i]:
-                        logs[f"lr/d*eff_lr/{lr_desc}"] = opt.param_groups[i]["d"] * opt.param_groups[i]["effective_lr"]
+                if lr_param_groups is not None:
+                    group = lr_param_groups[i]
+                else:
+                    opt = lr_scheduler.optimizers[-1] if hasattr(lr_scheduler, "optimizers") else optimizer
+                    group = opt.param_groups[i] if opt is not None else None
+                if group is not None:
+                    logs[f"lr/d*lr/{lr_desc}"] = group["d"] * group["lr"]
+                    if "effective_lr" in group:
+                        logs[f"lr/d*eff_lr/{lr_desc}"] = group["d"] * group["effective_lr"]
 
         return logs
 
@@ -903,6 +910,24 @@ class NetworkTrainer:
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
 
+        # Validate LoRA-Squeeze compatibility before loading datasets, models, or caches.
+        lora_squeeze = lora_squeeze_training.LoRASqueezeRuntime(args)
+        resume_state_dir = None
+        net_kwargs = {}
+        if args.network_args is not None:
+            for net_arg in args.network_args:
+                key, value = net_arg.split("=", 1)
+                net_kwargs[key] = value
+        network_module = None
+        if lora_squeeze.enabled:
+            sys.path.append(os.path.dirname(__file__))
+            network_module = importlib.import_module(args.network_module)
+            lora_squeeze.validate_network_module(network_module, net_kwargs)
+            if args.resume:
+                resume_state_dir = args_util.get_resume_state_dir(args)
+                lora_squeeze.restore_from_resume_dir(resume_state_dir)
+            net_kwargs = lora_squeeze.prepare_network_args(net_kwargs)
+
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
         use_user_config = args.dataset_config is not None
@@ -1000,6 +1025,10 @@ class NetworkTrainer:
         logger.info("preparing accelerator")
         accelerator = accelerator_setup.prepare_accelerator(args)
         is_main_process = accelerator.is_main_process
+        lora_squeeze.validate_process_count(accelerator.num_processes)
+        lora_squeeze_resume_message = lora_squeeze.resume_status_message(bool(args.resume))
+        if lora_squeeze_resume_message is not None:
+            accelerator.print(lora_squeeze_resume_message)
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
@@ -1048,8 +1077,8 @@ class NetworkTrainer:
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
         accelerator.print("import network module:", args.network_module)
-        network_module = importlib.import_module(args.network_module)
-
+        if network_module is None:
+            network_module = importlib.import_module(args.network_module)
         if args.base_weights is not None:
             # base_weights が指定されている場合は、指定された重みを読み込みマージする
             for i, weight_path in enumerate(args.base_weights):
@@ -1068,12 +1097,6 @@ class NetworkTrainer:
             accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
 
         # prepare network
-        net_kwargs = {}
-        if args.network_args is not None:
-            for net_arg in args.network_args:
-                key, value = net_arg.split("=", 1)
-                net_kwargs[key] = value
-
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
         if args.dim_from_weights:
             network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
@@ -1082,10 +1105,19 @@ class NetworkTrainer:
                 # workaround for LyCORIS (;^ω^)
                 net_kwargs["dropout"] = args.network_dropout
 
+            initial_network_dim, initial_network_alpha = lora_squeeze.initial_network_rank_alpha(
+                args.network_dim, args.network_alpha
+            )
+            lora_squeeze_creation_message = lora_squeeze.network_creation_status_message(
+                initial_network_dim, initial_network_alpha
+            )
+            if lora_squeeze_creation_message is not None:
+                accelerator.print(lora_squeeze_creation_message)
+
             network = network_module.create_network(
                 1.0,
-                args.network_dim,
-                args.network_alpha,
+                initial_network_dim,
+                initial_network_alpha,
                 vae,
                 text_encoder,
                 unet,
@@ -1117,8 +1149,19 @@ class NetworkTrainer:
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
-            info = network.load_weights(args.network_weights)
+            try:
+                info = network.load_weights(args.network_weights)
+            except RuntimeError as e:
+                if lora_squeeze.enabled:
+                    raise lora_squeeze.network_weights_load_error(e) from e
+                raise
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
+
+        if lora_squeeze.enabled:
+            preflight_stats = lora_squeeze.validate_network(network)
+            preflight_message = lora_squeeze.preflight_status_message(preflight_stats)
+            if preflight_message is not None:
+                accelerator.print(preflight_message)
 
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
@@ -1146,6 +1189,13 @@ class NetworkTrainer:
                 text_encoder_lr = args.text_encoder_lr
             else:
                 text_encoder_lr = None if len(args.text_encoder_lr) == 0 else args.text_encoder_lr[0]
+
+        # Some optimizer factories normalize args in place. LoRA-Squeeze rebuilds the optimizer after rank changes,
+        # so retain the original factory inputs and effective learning rates for those later rebuilds.
+        lora_squeeze_optimizer_factory_args = argparse.Namespace(**vars(args)) if lora_squeeze.enabled else None
+        lora_squeeze_text_encoder_lr = text_encoder_lr
+        lora_squeeze_unet_lr = args.unet_lr
+        lora_squeeze_default_lr = args.learning_rate
         try:
             if support_multiple_lrs:
                 results = network.prepare_optimizer_params_with_multiple_te_lrs(text_encoder_lr, args.unet_lr, args.learning_rate)
@@ -1173,6 +1223,9 @@ class NetworkTrainer:
 
         optimizer_name, optimizer_args, optimizer = optimizer_util.get_optimizer(args, trainable_params)
         optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
+        optimizer_state_adapter = lora_squeeze.preflight_optimizer(optimizer, network)
+        for message in lora_squeeze.optimizer_preflight_status_messages(optimizer_state_adapter):
+            accelerator.print(message)
 
         # prepare dataloader
         # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
@@ -1213,9 +1266,21 @@ class NetworkTrainer:
 
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
+        lora_squeeze.set_total_steps(args.max_train_steps)
+        for message in lora_squeeze.step_schedule_status_messages():
+            accelerator.print(message)
 
         # lr schedulerを用意する
-        lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        scheduler_training_steps = lora_squeeze.scheduler_training_steps()
+        if scheduler_training_steps is None:
+            lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        else:
+            lr_scheduler = optimizer_util.get_scheduler_fix(
+                args, optimizer, accelerator.num_processes, training_steps=scheduler_training_steps
+            )
+        for message in lora_squeeze.optimizer_scheduler_status_messages(scheduler_training_steps):
+            accelerator.print(message)
+        optimizer, lr_scheduler = lora_squeeze.prepare_optimizer_scheduler_for_accelerator(optimizer, lr_scheduler)
 
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
@@ -1230,6 +1295,7 @@ class NetworkTrainer:
             ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
             accelerator.print("enable full bf16 training.")
             network.to(weight_dtype)
+        lora_squeeze.preserve_alpha_precision(network)
 
         unet_weight_dtype = te_weight_dtype = weight_dtype
         # Experimental Feature: Put base model into fp8 to save vram
@@ -1350,9 +1416,14 @@ class NetworkTrainer:
             # save current ecpoch and step
             train_state_file = os.path.join(output_dir, "train_state.json")
             # +1 is needed because the state is saved before current_step is set from global_step
-            logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
+            state_step = current_step.value + 1
+            if lora_squeeze.enabled:
+                state_step = lora_squeeze.progress_step()
+            logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {state_step}")
+            train_state = {"current_epoch": current_epoch.value, "current_step": state_step}
+            lora_squeeze.add_to_train_state(train_state)
             with open(train_state_file, "w", encoding="utf-8") as f:
-                json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+                json.dump(train_state, f)
 
         steps_from_state = None
 
@@ -1373,13 +1444,19 @@ class NetworkTrainer:
                 with open(train_state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 steps_from_state = data["current_step"]
+                lora_squeeze.restore_from_train_state(data)
                 logger.info(f"load train state from {train_state_file}: {data}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
         # resumeする
-        args_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        if resume_state_dir is None:
+            args_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        else:
+            args_util.resume_from_local_or_hf_if_specified(accelerator, args, resume_state_dir)
+        if lora_squeeze.enabled and args.resume:
+            lora_squeeze.validate_network(accelerator.unwrap_model(network))
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1424,6 +1501,11 @@ class NetworkTrainer:
             use_dreambooth_method=use_dreambooth_method,
         )
 
+        def update_lora_squeeze_metadata():
+            lora_squeeze.update_metadata(self._metadata, self._minimum_metadata)
+
+        update_lora_squeeze_metadata()
+
         # calculate steps to skip when resuming or starting from a specific step
         initial_step = 0
         if args.initial_epoch is not None or args.initial_step is not None:
@@ -1446,11 +1528,22 @@ class NetworkTrainer:
                 steps_from_state = None
 
         if initial_step > 0:
-            assert (
-                args.max_train_steps > initial_step
-            ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
+            valid_step_budget = (
+                args.max_train_steps >= initial_step
+                if lora_squeeze.enabled
+                else args.max_train_steps > initial_step
+            )
+            assert valid_step_budget, (
+                "max_train_steps should be greater than initial step "
+                "(or equal for a completed LoRA-Squeeze resume) / "
+                f"max_train_steps: {args.max_train_steps} vs initial_step: {initial_step}"
+            )
+
+        lora_squeeze.set_initial_step(initial_step)
+        absolute_initial_step = initial_step
 
         epoch_to_start = 0
+        resume_batch_offset = 0
         if initial_step > 0:
             if args.skip_until_initial_step:
                 # if skip_until_initial_step is specified, load data and discard it to ensure the same data is used
@@ -1459,16 +1552,25 @@ class NetworkTrainer:
                         f"initial_step is specified but not resuming. lr scheduler will be started from the beginning / initial_stepが指定されていますがresumeしていないため、lr schedulerは最初から始まります"
                     )
                 logger.info(f"skipping {initial_step} steps / {initial_step}ステップをスキップします")
-                initial_step *= args.gradient_accumulation_steps
+                if lora_squeeze.enabled:
+                    epoch_to_start, resume_batch_offset = lora_squeeze.resume_epoch_and_batch_offset(
+                        initial_step,
+                        len(train_dataloader),
+                        args.gradient_accumulation_steps,
+                    )
+                else:
+                    initial_step *= args.gradient_accumulation_steps
 
-                # set epoch to start to make initial_step less than len(train_dataloader)
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+                    # set epoch to start to make initial_step less than len(train_dataloader)
+                    epoch_to_start = initial_step // math.ceil(
+                        len(train_dataloader) / args.gradient_accumulation_steps
+                    )
             else:
                 # if not, only epoch no is skipped for informative purpose
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
                 initial_step = 0  # do not skip
 
-        global_step = 0
+        global_step = absolute_initial_step if lora_squeeze.enabled else 0
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1488,6 +1590,51 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
+        def prepare_lora_squeeze_optimizer_params():
+            unwrapped_network = accelerator.unwrap_model(network)
+            try:
+                if support_multiple_lrs:
+                    results = unwrapped_network.prepare_optimizer_params_with_multiple_te_lrs(
+                        lora_squeeze_text_encoder_lr, lora_squeeze_unet_lr, lora_squeeze_default_lr
+                    )
+                else:
+                    results = unwrapped_network.prepare_optimizer_params(
+                        lora_squeeze_text_encoder_lr, lora_squeeze_unet_lr, lora_squeeze_default_lr
+                    )
+            except TypeError:
+                results = unwrapped_network.prepare_optimizer_params(
+                    lora_squeeze_text_encoder_lr, lora_squeeze_unet_lr
+                )
+            if type(results) is tuple:
+                return results[0], results[1]
+            return results, None
+
+        def refresh_lora_squeeze_grad():
+            accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
+
+        lora_squeeze_controller = None
+        if lora_squeeze.enabled:
+            lora_squeeze_controller = lora_squeeze_training.LoRASqueezeTrainingController(
+                args=args,
+                accelerator=accelerator,
+                schedule=lora_squeeze.schedule,
+                network=network,
+                optimizer_util=optimizer_util,
+                optimizer_name=optimizer_name,
+                optimizer_args=optimizer_args,
+                optimizer=optimizer,
+                optimizer_train_fn=optimizer_train_fn,
+                optimizer_eval_fn=optimizer_eval_fn,
+                lr_scheduler=lr_scheduler,
+                lr_descriptions=lr_descriptions,
+                prepare_optimizer_params_fn=prepare_lora_squeeze_optimizer_params,
+                prepare_grad_fn=refresh_lora_squeeze_grad,
+                update_metadata_fn=update_lora_squeeze_metadata,
+                clean_memory_fn=lambda: clean_memory_on_device(accelerator.device),
+                logger=logger,
+                optimizer_factory_args=lora_squeeze_optimizer_factory_args,
+            )
+
         # if text_encoder is not needed for training, delete it to save memory.
         # TODO this can be automated after SDXL sample prompt cache is implemented
         if self.is_text_encoder_not_needed_for_training(args):
@@ -1506,10 +1653,12 @@ class NetworkTrainer:
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
             # log empty object to commit the sample images to wandb
-            accelerator.log({}, step=0)
+            accelerator.log({}, step=global_step)
 
         # training loop
-        if initial_step > 0:  # only if skip_until_initial_step is specified
+        if lora_squeeze.enabled:
+            initial_step = resume_batch_offset
+        elif initial_step > 0:  # only if skip_until_initial_step is specified
             for skip_epoch in range(epoch_to_start):  # skip epochs
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
                 initial_step -= len(train_dataloader)
@@ -1527,7 +1676,12 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(
+                lora_squeeze.remaining_steps(args.max_train_steps, global_step)
+            ),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
 
         validation_steps = (
@@ -1571,6 +1725,8 @@ class NetworkTrainer:
             random.setstate(python_rng_state)
 
         for epoch in range(epoch_to_start, num_train_epochs):
+            if lora_squeeze.budget_exhausted(args.max_train_steps, global_step):
+                break
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
 
@@ -1590,6 +1746,7 @@ class NetworkTrainer:
                     initial_step -= 1
                     continue
 
+                lora_squeeze_step_context = None
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
@@ -1629,6 +1786,7 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    lora_squeeze_step_context = lora_squeeze.capture_step_context(optimizer)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1658,6 +1816,19 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+
+                    if lora_squeeze.run_after_optimizer_step(
+                        lora_squeeze_controller, lora_squeeze_step_context, global_step
+                    ):
+                        (
+                            optimizer_name,
+                            optimizer_args,
+                            optimizer,
+                            optimizer_train_fn,
+                            optimizer_eval_fn,
+                            lr_scheduler,
+                            lr_descriptions,
+                        ) = lora_squeeze_controller.export_training_state()
 
                     optimizer_eval_fn()
                     self.sample_images(
@@ -1693,6 +1864,8 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                if lora_squeeze_step_context is not None:
+                    logs["lora_squeeze_dim"] = lora_squeeze_step_context.train_dim
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if is_tracking:
@@ -1708,7 +1881,18 @@ class NetworkTrainer:
                         maximum_norm,
                         mean_grad_norm,
                         mean_combined_norm,
+                        learning_rates=(
+                            lora_squeeze_step_context.learning_rates
+                            if lora_squeeze_step_context is not None
+                            else None
+                        ),
+                        lr_param_groups=(
+                            lora_squeeze_step_context.optimizer_param_groups
+                            if lora_squeeze_step_context is not None
+                            else None
+                        ),
                     )
+                    lora_squeeze.append_step_logs(logs, lora_squeeze_step_context)
                     self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
@@ -1752,7 +1936,7 @@ class NetworkTrainer:
                     accelerator.unwrap_model(network).train()
                     progress_bar.unpause()
 
-                if global_step >= args.max_train_steps:
+                if lora_squeeze.budget_exhausted(args.max_train_steps, global_step):
                     break
 
             # EPOCH VALIDATION
@@ -1876,6 +2060,7 @@ def setup_parser() -> argparse.ArgumentParser:
     args_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
+    args_util.add_lora_squeeze_arguments(parser)
 
     parser.add_argument(
         "--cpu_offload_checkpointing",

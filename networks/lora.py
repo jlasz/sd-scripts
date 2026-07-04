@@ -13,6 +13,7 @@ import torch
 import re
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from library.lora_squeeze_network import StandardLoRASqueezeModuleMixin
 
 setup_logging()
 import logging
@@ -22,7 +23,11 @@ logger = logging.getLogger(__name__)
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
 
-class LoRAModule(torch.nn.Module):
+def validate_lora_squeeze_support(_network_args: Dict[str, str]):
+    """Declare early compatibility; instantiated factors are validated separately."""
+
+
+class LoRAModule(StandardLoRASqueezeModuleMixin, torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
     """
@@ -1063,6 +1068,10 @@ class LoRANetwork(torch.nn.Module):
         self.multiplier = multiplier
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.multiplier = self.multiplier
+
+    def get_lora_squeeze_modules(self):
+        """Expose only factors whose replacement lifecycle this network owns."""
+        return tuple(self.text_encoder_loras + self.unet_loras)
 
     def set_enabled(self, is_enabled):
         for lora in self.text_encoder_loras + self.unet_loras:

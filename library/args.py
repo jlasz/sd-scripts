@@ -16,6 +16,7 @@ import toml
 from huggingface_hub import hf_hub_download
 
 import library.huggingface_util as huggingface_util
+from library.lora_squeeze_schedule import LoRASqueezeSchedule
 from library.utils import setup_logging
 
 setup_logging()
@@ -174,6 +175,115 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="The minimum learning rate as a ratio of the initial learning rate for cosine with min lr scheduler and warmup decay scheduler"
         + " / 初期学習率の比率としての最小学習率を指定する、cosine with min lr と warmup decay スケジューラ で有効",
+    )
+
+
+def add_lora_squeeze_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--lora_squeeze_start_dim",
+        type=int,
+        default=None,
+        help=(
+            "initial LoRA rank for LoRA-Squeeze; --network_dim remains the final target rank"
+            " / LoRA-Squeezeの初期LoRAランク。--network_dimは最終ターゲットランクのままです"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_num_squeezes",
+        type=int,
+        default=0,
+        help=(
+            "number of scheduled LoRA-Squeeze rank reductions to perform"
+            " / LoRA-Squeezeで予定するランク削減の回数"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_train_after_final_squeeze",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "continue training for one final segment after squeezing to --network_dim"
+            " / --network_dimまで圧縮した後も最後の区間の学習を続けます"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_optimizer_mode",
+        type=str,
+        default="per_squeeze",
+        choices=LoRASqueezeSchedule.STATE_MODE_CHOICES,
+        help=(
+            "choose optimizer continuity across squeezes: global uses an optimizer-specific state transfer; "
+            "per_squeeze resets optimizer state for each rank segment"
+            " / 圧縮前後のオプティマイザ状態を選択します。globalはオプティマイザ固有の状態変換を行い、"
+            "per_squeezeはランク区間ごとにオプティマイザ状態をリセットします"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_scheduler_mode",
+        type=str,
+        default="global",
+        choices=LoRASqueezeSchedule.STATE_MODE_CHOICES,
+        help=(
+            "choose LR scheduler continuity across squeezes: global continues one training curve; "
+            "per_squeeze restarts the curve for each rank segment"
+            " / 圧縮前後のLRスケジューラ状態を選択します。globalは学習全体で1つの曲線を継続し、"
+            "per_squeezeはランク区間ごとに曲線を再開します"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_rank_schedule",
+        type=str,
+        default="geometric",
+        choices=LoRASqueezeSchedule.RANK_SCHEDULE_CHOICES,
+        help=(
+            "choose how intermediate LoRA-Squeeze ranks are spaced; linear uses equal rank differences, "
+            "geometric uses approximately equal compression ratios"
+            " / LoRA-Squeezeの中間ランクの配置方法。linearはランク差を均等にし、"
+            "geometricは圧縮率をほぼ均等にします"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_step_schedule",
+        type=str,
+        default="equal",
+        choices=LoRASqueezeSchedule.STEP_SCHEDULE_CHOICES,
+        help=(
+            "spread LoRA-Squeeze training steps by current rank; equal uses equal segments. "
+            "Use inverse modes to give smaller ranks more steps"
+            " / LoRA-Squeezeの学習ステップを現在のランクに応じて配分します。equalは各区間を均等にし、"
+            "inverse系は小さいランクにより多くのステップを割り当てます"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_alpha_schedule",
+        type=str,
+        default="proportional",
+        choices=LoRASqueezeSchedule.ALPHA_SCHEDULE_CHOICES,
+        help=(
+            "choose how pre-final-rank alpha values are derived: proportional keeps alpha/rank equal to the "
+            "final network_alpha/network_dim ratio; sqrt uses rank-stabilized sqrt(rank) scaling"
+            " / 最終ランク前のalphaの計算方法。proportionalはalpha/rankを最終network_alpha/network_dimと"
+            "同じ比率に保ち、sqrtはsqrt(rank)によるランク安定化スケーリングを使用します"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_first_segment_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "multiply the relative length of the initial high-rank training segment"
+            " / 最初の高ランク学習区間の相対的な長さに掛ける倍率"
+        ),
+    )
+    parser.add_argument(
+        "--lora_squeeze_final_segment_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "multiply the final post-squeeze training segment length when "
+            "--lora_squeeze_train_after_final_squeeze is used"
+            " / --lora_squeeze_train_after_final_squeeze使用時に、圧縮後の最後の学習区間の長さに掛ける倍率"
+        ),
     )
 
 
@@ -739,8 +849,16 @@ def get_sanitized_config_or_none(args: argparse.Namespace):
         "output_dir",
         "logging_dir",
     ]
+    lora_squeeze_enabled = (
+        getattr(args, "lora_squeeze_start_dim", None) is not None
+        or getattr(args, "lora_squeeze_num_squeezes", 0) > 0
+    )
     filtered_args = {}
     for k, v in vars(args).items():
+        # Keep ordinary tracker configurations identical to the pre-LoRA-Squeeze
+        # schema. The feature-specific defaults are useful only when enabled.
+        if not lora_squeeze_enabled and k.startswith("lora_squeeze_"):
+            continue
         # filter out sensitive values and convert to string if necessary
         if k not in sensitive_args + sensitive_path_args:
             # Accelerate values need to have type `bool`,`str`, `float`, `int`, or `None`.
@@ -1186,16 +1304,13 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
     return args
 
 
-def resume_from_local_or_hf_if_specified(accelerator, args):
+def get_resume_state_dir(args):
     if not args.resume:
-        return
+        return None
 
     if not args.resume_from_huggingface:
-        logger.info(f"resume training from local state: {args.resume}")
-        accelerator.load_state(args.resume)
-        return
+        return args.resume
 
-    logger.info(f"resume training from huggingface state: {args.resume}")
     repo_id = args.resume.split("/")[0] + "/" + args.resume.split("/")[1]
     path_in_repo = "/".join(args.resume.split("/")[2:])
     revision = None
@@ -1235,5 +1350,18 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
         raise ValueError(
             "No files found in the specified repo id/path/revision / 指定されたリポジトリID/パス/リビジョンにファイルが見つかりませんでした"
         )
-    dirname = os.path.dirname(results[0])
-    accelerator.load_state(dirname)
+    return os.path.dirname(results[0])
+
+
+def resume_from_local_or_hf_if_specified(accelerator, args, resume_state_dir=None):
+    if not args.resume:
+        return
+
+    if not args.resume_from_huggingface:
+        logger.info(f"resume training from local state: {args.resume}")
+    else:
+        logger.info(f"resume training from huggingface state: {args.resume}")
+
+    if resume_state_dir is None:
+        resume_state_dir = get_resume_state_dir(args)
+    accelerator.load_state(resume_state_dir)

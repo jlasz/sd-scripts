@@ -127,6 +127,7 @@ from library.model_io import (  # noqa: F401, E402
 from library.args import (  # noqa: F401, E402
     add_sd_models_arguments,
     add_optimizer_arguments,
+    add_lora_squeeze_arguments,
     add_training_arguments,
     add_masked_loss_arguments,
     add_dit_training_arguments,
