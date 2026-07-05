@@ -1,6 +1,7 @@
 import gc
 import importlib
 import argparse
+import copy
 import math
 import os
 import typing
@@ -41,6 +42,7 @@ import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.lora_squeeze_training as lora_squeeze_training
 import library.rms_utils as rms_utils
+from library.rms_step_probe import build_rms_probe_args, estimate_rms_adjusted_steps, validate_rms_probe_configuration
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -593,6 +595,12 @@ class NetworkTrainer:
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
             "ss_total_rms_check_every_n_steps": args.total_rms_check_every_n_steps,
+            "ss_rms_probe_target": args.rms_probe_target,
+            "ss_rms_probe_steps": args.rms_probe_steps,
+            "ss_rms_probe_observed": getattr(args, "_rms_probe_observed", None),
+            "ss_rms_probe_step_multiplier": getattr(args, "_rms_probe_step_multiplier", None),
+            "ss_rms_probe_original_max_train_steps": getattr(args, "_rms_probe_original_max_train_steps", None),
+            "ss_rms_probe_is_probe_run": bool(getattr(args, "_is_rms_probe_run", False)),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -908,6 +916,76 @@ class NetworkTrainer:
             os.remove(old_ckpt_file)
 
     def train(self, args):
+        if not validate_rms_probe_configuration(args):
+            return self._train(args)
+
+        original_args = copy.deepcopy(args)
+        if original_args.seed is None:
+            original_args.seed = random.randint(0, 2**32)
+        original_steps = original_args.max_train_steps
+        probe_args = build_rms_probe_args(original_args)
+
+        logger.info(
+            "starting isolated RMS probe: steps=%s, reference_rms=%.8g, production_steps=%s, output_dir=%s",
+            probe_args.rms_probe_steps,
+            probe_args.rms_probe_target,
+            original_steps,
+            probe_args.output_dir,
+        )
+        probe_trainer = type(self)()
+        probe_result = probe_trainer._train(probe_args)
+        observed_rms = probe_result["total_rms"]
+        adjusted_steps, step_multiplier = estimate_rms_adjusted_steps(
+            original_steps,
+            original_args.rms_probe_target,
+            observed_rms,
+        )
+
+        summary = {
+            "seed": original_args.seed,
+            "probe_steps": original_args.rms_probe_steps,
+            "target_rms": original_args.rms_probe_target,
+            "observed_rms": observed_rms,
+            "step_multiplier": step_multiplier,
+            "original_max_train_steps": original_steps,
+            "adjusted_max_train_steps": adjusted_steps,
+        }
+        if probe_result["is_main_process"]:
+            os.makedirs(probe_args.output_dir, exist_ok=True)
+            summary_path = os.path.join(probe_args.output_dir, "rms_probe_result.json")
+            with open(summary_path, "w", encoding="utf-8") as file:
+                json.dump(summary, file, indent=2)
+            logger.info("saved RMS probe result to %s", summary_path)
+
+        logger.info(
+            "RMS probe complete: observed=%.8g, target=%.8g, multiplier=%.8g; "
+            "adjusting max_train_steps from %s to %s",
+            observed_rms,
+            original_args.rms_probe_target,
+            step_multiplier,
+            original_steps,
+            adjusted_steps,
+        )
+
+        del probe_trainer
+        strategy_base.reset_strategies()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "xpu") and torch.xpu.is_available() and hasattr(torch.xpu, "empty_cache"):
+            torch.xpu.empty_cache()
+
+        production_args = copy.deepcopy(original_args)
+        production_args.max_train_steps = adjusted_steps
+        production_args._rms_probe_observed = observed_rms
+        production_args._rms_probe_step_multiplier = step_multiplier
+        production_args._rms_probe_original_max_train_steps = original_steps
+        production_args._is_rms_probe_run = False
+
+        logger.info("starting fresh production run with max_train_steps=%s", adjusted_steps)
+        return self._train(production_args)
+
+    def _train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         args_util.verify_training_args(args)
@@ -915,6 +993,13 @@ class NetworkTrainer:
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
         rms_utils.validate_rms_log_interval(args.total_rms_check_every_n_steps)
+
+        training_step_limit = getattr(args, "_training_step_limit", args.max_train_steps)
+        if training_step_limit <= 0 or training_step_limit > args.max_train_steps:
+            raise ValueError(
+                "internal training step limit must be between 1 and max_train_steps: "
+                f"{training_step_limit} vs {args.max_train_steps}"
+            )
 
         # Validate LoRA-Squeeze compatibility before loading datasets, models, or caches.
         lora_squeeze = lora_squeeze_training.LoRASqueezeRuntime(args)
@@ -1488,6 +1573,8 @@ class NetworkTrainer:
         # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+        if training_step_limit != args.max_train_steps:
+            accelerator.print(f"  RMS probe stops after optimization step: {training_step_limit}")
 
         self._build_metadata(
             args,
@@ -1683,7 +1770,7 @@ class NetworkTrainer:
 
         progress_bar = tqdm(
             range(
-                lora_squeeze.remaining_steps(args.max_train_steps, global_step)
+                lora_squeeze.remaining_steps(training_step_limit, global_step)
             ),
             smoothing=0,
             disable=not accelerator.is_local_main_process,
@@ -1730,8 +1817,9 @@ class NetworkTrainer:
                     torch.cuda.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
+        probe_observed_rms = None
         for epoch in range(epoch_to_start, num_train_epochs):
-            if lora_squeeze.budget_exhausted(args.max_train_steps, global_step):
+            if lora_squeeze.budget_exhausted(training_step_limit, global_step):
                 break
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
@@ -1844,6 +1932,12 @@ class NetworkTrainer:
                         step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
                         accelerator.print(f"total_rms={step_total_rms:.8g}")
 
+                    if getattr(args, "_is_rms_probe_run", False) and global_step == training_step_limit:
+                        if step_total_rms is None:
+                            step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
+                        probe_observed_rms = step_total_rms
+                        accelerator.print(f"rms_probe_observed={probe_observed_rms:.8g}")
+
                     optimizer_eval_fn()
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
@@ -1952,7 +2046,7 @@ class NetworkTrainer:
                     accelerator.unwrap_model(network).train()
                     progress_bar.unpause()
 
-                if lora_squeeze.budget_exhausted(args.max_train_steps, global_step):
+                if lora_squeeze.budget_exhausted(training_step_limit, global_step):
                     break
 
             # EPOCH VALIDATION
@@ -2041,6 +2135,11 @@ class NetworkTrainer:
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
+        if getattr(args, "_is_rms_probe_run", False) and probe_observed_rms is None:
+            raise RuntimeError("RMS probe ended without measuring its configured probe step")
+        if probe_observed_rms is not None:
+            self._metadata["ss_rms_probe_observed"] = str(probe_observed_rms)
+
         accelerator.end_training()
         optimizer_eval_fn()
 
@@ -2056,11 +2155,19 @@ class NetworkTrainer:
                 ckpt_name=ckpt_name,
                 unwrapped_nw=network,
                 steps=global_step,
-                epoch_no=num_train_epochs,
+                epoch_no=current_epoch.value,
                 force_sync_upload=True,
             )
 
             logger.info("model saved.")
+
+        if getattr(args, "_is_rms_probe_run", False):
+            accelerator.wait_for_everyone()
+            return {
+                "global_step": global_step,
+                "total_rms": probe_observed_rms,
+                "is_main_process": is_main_process,
+            }
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -2083,6 +2190,22 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="log total scaled LoRA RMS every N optimizer steps; 0 disables RMS logging",
+    )
+
+    parser.add_argument(
+        "--rms_probe_target",
+        type=float,
+        default=None,
+        help=(
+            "reference model's total scaled LoRA RMS at --rms_probe_steps; run an isolated probe, then "
+            "start fresh training with max_train_steps multiplied by target RMS / observed RMS"
+        ),
+    )
+    parser.add_argument(
+        "--rms_probe_steps",
+        type=int,
+        default=None,
+        help="number of optimizer steps in the isolated RMS probe run",
     )
 
     parser.add_argument(
