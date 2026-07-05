@@ -40,6 +40,7 @@ import library.loss as loss_util
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.lora_squeeze_training as lora_squeeze_training
+import library.rms_utils as rms_utils
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -591,6 +592,7 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
+            "ss_total_rms_check_every_n_steps": args.total_rms_check_every_n_steps,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -912,6 +914,7 @@ class NetworkTrainer:
         accelerator_setup.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+        rms_utils.validate_rms_log_interval(args.total_rms_check_every_n_steps)
 
         # Validate LoRA-Squeeze compatibility before loading datasets, models, or caches.
         lora_squeeze = lora_squeeze_training.LoRASqueezeRuntime(args)
@@ -1816,6 +1819,7 @@ class NetworkTrainer:
                         max_mean_logs = {}
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
+                step_total_rms = None
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
@@ -1832,6 +1836,13 @@ class NetworkTrainer:
                             lr_scheduler,
                             lr_descriptions,
                         ) = lora_squeeze_controller.export_training_state()
+
+                    if (
+                        args.total_rms_check_every_n_steps > 0
+                        and global_step % args.total_rms_check_every_n_steps == 0
+                    ):
+                        step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
+                        accelerator.print(f"total_rms={step_total_rms:.8g}")
 
                     optimizer_eval_fn()
                     self.sample_images(
@@ -1896,6 +1907,8 @@ class NetworkTrainer:
                         ),
                     )
                     lora_squeeze.append_step_logs(logs, lora_squeeze_step_context)
+                    if step_total_rms is not None:
+                        logs["strength/total_rms"] = step_total_rms
                     self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
@@ -2064,6 +2077,13 @@ def setup_parser() -> argparse.ArgumentParser:
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
     args_util.add_lora_squeeze_arguments(parser)
+
+    parser.add_argument(
+        "--total_rms_check_every_n_steps",
+        type=int,
+        default=0,
+        help="log total scaled LoRA RMS every N optimizer steps; 0 disables RMS logging",
+    )
 
     parser.add_argument(
         "--cpu_offload_checkpointing",
