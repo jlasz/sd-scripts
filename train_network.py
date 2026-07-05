@@ -1817,6 +1817,7 @@ class NetworkTrainer:
                     torch.cuda.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
+        last_total_rms = None
         probe_observed_rms = None
         for epoch in range(epoch_to_start, num_train_epochs):
             if lora_squeeze.budget_exhausted(training_step_limit, global_step):
@@ -1930,12 +1931,13 @@ class NetworkTrainer:
                         and global_step % args.total_rms_check_every_n_steps == 0
                     ):
                         step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
-                        accelerator.print(f"total_rms={step_total_rms:.8g}", flush=True)
+                        last_total_rms = step_total_rms
 
                     if getattr(args, "_is_rms_probe_run", False) and global_step == training_step_limit:
                         if step_total_rms is None:
                             step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
                         probe_observed_rms = step_total_rms
+                        last_total_rms = probe_observed_rms
                         accelerator.print(f"rms_probe_observed={probe_observed_rms:.8g}", flush=True)
 
                     optimizer_eval_fn()
@@ -1974,6 +1976,8 @@ class NetworkTrainer:
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 if lora_squeeze_step_context is not None:
                     logs["lora_squeeze_dim"] = lora_squeeze_step_context.train_dim
+                if last_total_rms is not None:
+                    logs["total_rms"] = f"{last_total_rms:.8g}"
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if is_tracking:
@@ -2001,8 +2005,8 @@ class NetworkTrainer:
                         ),
                     )
                     lora_squeeze.append_step_logs(logs, lora_squeeze_step_context)
-                    if step_total_rms is not None:
-                        logs["strength/total_rms"] = step_total_rms
+                    if last_total_rms is not None:
+                        logs["strength/total_rms"] = last_total_rms
                     self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
