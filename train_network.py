@@ -1930,13 +1930,13 @@ class NetworkTrainer:
                         and global_step % args.total_rms_check_every_n_steps == 0
                     ):
                         step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
-                        accelerator.print(f"total_rms={step_total_rms:.8g}")
+                        accelerator.print(f"total_rms={step_total_rms:.8g}", flush=True)
 
                     if getattr(args, "_is_rms_probe_run", False) and global_step == training_step_limit:
                         if step_total_rms is None:
                             step_total_rms = rms_utils.compute_total_scaled_lora_rms(accelerator.unwrap_model(network))
                         probe_observed_rms = step_total_rms
-                        accelerator.print(f"rms_probe_observed={probe_observed_rms:.8g}")
+                        accelerator.print(f"rms_probe_observed={probe_observed_rms:.8g}", flush=True)
 
                     optimizer_eval_fn()
                     self.sample_images(
