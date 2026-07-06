@@ -5,13 +5,19 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from library.rms_step_probe import build_rms_probe_args, estimate_rms_adjusted_steps, validate_rms_probe_configuration
+from library.rms_step_probe import (
+    build_rms_probe_args,
+    estimate_rms_adjusted_steps,
+    round_steps_to_nearest_multiple,
+    validate_rms_probe_configuration,
+)
 
 
 def make_args(**overrides):
     values = {
         "rms_probe_target": 0.0001,
         "rms_probe_steps": 500,
+        "rms_probe_adjusted_steps_divisible_by": None,
         "max_train_steps": 5000,
         "max_train_epochs": None,
         "resume": None,
@@ -53,6 +59,27 @@ class RMSStepProbeTest(unittest.TestCase):
     def test_zero_observed_rms_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "zero RMS"):
             estimate_rms_adjusted_steps(5000, 0.0001, 0.0)
+
+    def test_adjusted_steps_can_be_rounded_to_nearest_multiple(self):
+        self.assertEqual(round_steps_to_nearest_multiple(4398, 5), 4400)
+        self.assertEqual(round_steps_to_nearest_multiple(4397, 5), 4395)
+        self.assertEqual(round_steps_to_nearest_multiple(10, 4), 12)
+        self.assertEqual(round_steps_to_nearest_multiple(1, 5), 5)
+        self.assertEqual(round_steps_to_nearest_multiple(4398, None), 4398)
+
+    def test_adjusted_step_multiple_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "greater than 0"):
+            validate_rms_probe_configuration(make_args(rms_probe_adjusted_steps_divisible_by=0))
+
+    def test_adjusted_step_multiple_requires_probe(self):
+        with self.assertRaisesRegex(ValueError, "requires --rms_probe_target"):
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_target=None,
+                    rms_probe_steps=None,
+                    rms_probe_adjusted_steps_divisible_by=5,
+                )
+            )
 
     def test_probe_parameters_must_be_given_together(self):
         with self.assertRaisesRegex(ValueError, "must be specified together"):

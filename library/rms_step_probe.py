@@ -8,8 +8,13 @@ from typing import Tuple
 def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
     target = args.rms_probe_target
     steps = args.rms_probe_steps
+    step_multiple = args.rms_probe_adjusted_steps_divisible_by
 
     if target is None and steps is None:
+        if step_multiple is not None:
+            raise ValueError(
+                "--rms_probe_adjusted_steps_divisible_by requires --rms_probe_target and --rms_probe_steps"
+            )
         return False
     if target is None or steps is None:
         raise ValueError("--rms_probe_target and --rms_probe_steps must be specified together")
@@ -29,6 +34,8 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
         raise ValueError("RMS probe step estimation cannot be used with --initial_step or --initial_epoch")
     if args.deepspeed:
         raise ValueError("RMS probe step estimation does not support --deepspeed")
+    if step_multiple is not None and step_multiple <= 0:
+        raise ValueError("--rms_probe_adjusted_steps_divisible_by must be greater than 0")
 
     return True
 
@@ -44,6 +51,21 @@ def estimate_rms_adjusted_steps(original_steps: int, target_rms: float, observed
     step_multiplier = target_rms / observed_rms
     adjusted_steps = max(1, math.floor(original_steps * step_multiplier + 0.5))
     return adjusted_steps, step_multiplier
+
+
+def round_steps_to_nearest_multiple(steps: int, multiple: int | None) -> int:
+    if steps <= 0:
+        raise ValueError("steps must be greater than 0")
+    if multiple is None:
+        return steps
+    if multiple <= 0:
+        raise ValueError("multiple must be greater than 0")
+
+    lower = (steps // multiple) * multiple
+    upper = lower + multiple
+    if lower == 0:
+        return upper
+    return lower if steps - lower < upper - steps else upper
 
 
 def build_rms_probe_args(args: argparse.Namespace) -> argparse.Namespace:

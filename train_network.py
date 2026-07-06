@@ -42,7 +42,12 @@ import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.lora_squeeze_training as lora_squeeze_training
 import library.rms_utils as rms_utils
-from library.rms_step_probe import build_rms_probe_args, estimate_rms_adjusted_steps, validate_rms_probe_configuration
+from library.rms_step_probe import (
+    build_rms_probe_args,
+    estimate_rms_adjusted_steps,
+    round_steps_to_nearest_multiple,
+    validate_rms_probe_configuration,
+)
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -600,6 +605,8 @@ class NetworkTrainer:
             "ss_rms_probe_observed": getattr(args, "_rms_probe_observed", None),
             "ss_rms_probe_step_multiplier": getattr(args, "_rms_probe_step_multiplier", None),
             "ss_rms_probe_original_max_train_steps": getattr(args, "_rms_probe_original_max_train_steps", None),
+            "ss_rms_probe_estimated_max_train_steps": getattr(args, "_rms_probe_estimated_max_train_steps", None),
+            "ss_rms_probe_adjusted_steps_divisible_by": args.rms_probe_adjusted_steps_divisible_by,
             "ss_rms_probe_is_probe_run": bool(getattr(args, "_is_rms_probe_run", False)),
         }
 
@@ -935,10 +942,14 @@ class NetworkTrainer:
         probe_trainer = type(self)()
         probe_result = probe_trainer._train(probe_args)
         observed_rms = probe_result["total_rms"]
-        adjusted_steps, step_multiplier = estimate_rms_adjusted_steps(
+        estimated_steps, step_multiplier = estimate_rms_adjusted_steps(
             original_steps,
             original_args.rms_probe_target,
             observed_rms,
+        )
+        adjusted_steps = round_steps_to_nearest_multiple(
+            estimated_steps,
+            original_args.rms_probe_adjusted_steps_divisible_by,
         )
 
         summary = {
@@ -948,6 +959,8 @@ class NetworkTrainer:
             "observed_rms": observed_rms,
             "step_multiplier": step_multiplier,
             "original_max_train_steps": original_steps,
+            "estimated_max_train_steps": estimated_steps,
+            "adjusted_steps_divisible_by": original_args.rms_probe_adjusted_steps_divisible_by,
             "adjusted_max_train_steps": adjusted_steps,
         }
         if probe_result["is_main_process"]:
@@ -956,6 +969,15 @@ class NetworkTrainer:
             with open(summary_path, "w", encoding="utf-8") as file:
                 json.dump(summary, file, indent=2)
             logger.info("saved RMS probe result to %s", summary_path)
+
+        if adjusted_steps != estimated_steps:
+            logger.info(
+                "RMS probe step divisibility: rounded estimated max_train_steps from %s to %s "
+                "(nearest multiple of %s)",
+                estimated_steps,
+                adjusted_steps,
+                original_args.rms_probe_adjusted_steps_divisible_by,
+            )
 
         logger.info(
             "RMS probe complete: observed=%.8g, target=%.8g, multiplier=%.8g; "
@@ -980,6 +1002,7 @@ class NetworkTrainer:
         production_args._rms_probe_observed = observed_rms
         production_args._rms_probe_step_multiplier = step_multiplier
         production_args._rms_probe_original_max_train_steps = original_steps
+        production_args._rms_probe_estimated_max_train_steps = estimated_steps
         production_args._is_rms_probe_run = False
 
         logger.info("starting fresh production run with max_train_steps=%s", adjusted_steps)
@@ -2210,6 +2233,15 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="number of optimizer steps in the isolated RMS probe run",
+    )
+    parser.add_argument(
+        "--rms_probe_adjusted_steps_divisible_by",
+        type=int,
+        default=None,
+        help=(
+            "after RMS probe step estimation, round production max_train_steps to the nearest multiple of N; "
+            "ties round upward"
+        ),
     )
 
     parser.add_argument(
