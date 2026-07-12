@@ -617,6 +617,9 @@ class NetworkTrainer:
             "ss_rms_probe_gradient_accumulation_target_microbatches": (
                 args.rms_probe_gradient_accumulation_target_microbatches
             ),
+            "ss_rms_probe_gradient_accumulation_rounding_bias": (
+                args.rms_probe_gradient_accumulation_rounding_bias
+            ),
             "ss_rms_probe_original_gradient_accumulation_steps": getattr(
                 args, "_rms_probe_original_gradient_accumulation_steps", None
             ),
@@ -981,6 +984,7 @@ class NetworkTrainer:
             original_args.rms_probe_gradient_accumulation_target_microbatches,
             original_args.gradient_accumulation_steps,
             original_args.rms_probe_min_gradient_accumulation_steps,
+            original_args.rms_probe_gradient_accumulation_rounding_bias,
         )
 
         summary = {
@@ -999,6 +1003,9 @@ class NetworkTrainer:
             "dataset_batches_per_epoch": probe_result["dataset_batches_per_epoch"],
             "gradient_accumulation_target_microbatches": (
                 original_args.rms_probe_gradient_accumulation_target_microbatches
+            ),
+            "gradient_accumulation_rounding_bias": (
+                original_args.rms_probe_gradient_accumulation_rounding_bias
             ),
             "original_gradient_accumulation_steps": original_args.gradient_accumulation_steps,
             "adjusted_gradient_accumulation_steps": adjusted_gradient_accumulation_steps,
@@ -2330,8 +2337,17 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "after estimating steps, reduce gradient accumulation to keep max_train_steps * "
-            "gradient_accumulation_steps near this microbatch budget; never increases the configured value"
+            "after estimating steps, choose gradient accumulation so max_train_steps * "
+            "gradient_accumulation_steps remains near this microbatch budget"
+        ),
+    )
+    parser.add_argument(
+        "--rms_probe_gradient_accumulation_rounding_bias",
+        type=float,
+        default=0.6,
+        help=(
+            "bias used when rounding the ideal gradient accumulation: 0.5 is nearest, 0.6 modestly favors "
+            "more microbatches, and 1.0 rounds upward"
         ),
     )
     parser.add_argument(

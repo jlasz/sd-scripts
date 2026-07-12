@@ -26,6 +26,9 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
     curve_interval = getattr(args, "rms_probe_curve_every_n_steps", 20)
     microbatch_target = getattr(args, "rms_probe_gradient_accumulation_target_microbatches", None)
     minimum_gradient_accumulation = getattr(args, "rms_probe_min_gradient_accumulation_steps", 1)
+    gradient_accumulation_rounding_bias = getattr(
+        args, "rms_probe_gradient_accumulation_rounding_bias", 0.6
+    )
 
     if policy not in SCALING_POLICIES:
         raise ValueError("--rms_probe_scaling_policy must be one of: " + ", ".join(SCALING_POLICIES))
@@ -62,10 +65,12 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
         raise ValueError("--rms_probe_gradient_accumulation_target_microbatches must be greater than 0")
     if minimum_gradient_accumulation <= 0:
         raise ValueError("--rms_probe_min_gradient_accumulation_steps must be greater than 0")
-    if minimum_gradient_accumulation > args.gradient_accumulation_steps:
-        raise ValueError(
-            "--rms_probe_min_gradient_accumulation_steps cannot exceed --gradient_accumulation_steps"
-        )
+    if (
+        not math.isfinite(gradient_accumulation_rounding_bias)
+        or gradient_accumulation_rounding_bias < 0
+        or gradient_accumulation_rounding_bias > 1
+    ):
+        raise ValueError("--rms_probe_gradient_accumulation_rounding_bias must be between 0 and 1")
 
     if policy == PIECEWISE_ENERGY_POLICY:
         if curve_interval <= 0:
@@ -234,22 +239,28 @@ def choose_gradient_accumulation_steps(
     target_microbatches: int | None,
     current_gradient_accumulation_steps: int,
     minimum_gradient_accumulation_steps: int = 1,
+    rounding_bias: float = 0.6,
 ) -> int:
-    """Keep steps * accumulation near a compute budget without increasing accumulation."""
+    """Choose accumulation near a compute budget with configurable upward bias."""
 
     if total_steps <= 0 or current_gradient_accumulation_steps <= 0:
         raise ValueError("training steps and gradient accumulation must be greater than 0")
     if minimum_gradient_accumulation_steps <= 0:
         raise ValueError("minimum gradient accumulation must be greater than 0")
-    if minimum_gradient_accumulation_steps > current_gradient_accumulation_steps:
-        raise ValueError("minimum gradient accumulation cannot exceed current gradient accumulation")
+    if not math.isfinite(rounding_bias) or rounding_bias < 0 or rounding_bias > 1:
+        raise ValueError("rounding_bias must be between 0 and 1")
     if target_microbatches is None:
         return current_gradient_accumulation_steps
     if target_microbatches <= 0:
         raise ValueError("target_microbatches must be greater than 0")
 
-    nearest = math.floor(target_microbatches / total_steps + 0.5)
-    return min(current_gradient_accumulation_steps, max(minimum_gradient_accumulation_steps, nearest))
+    ideal_accumulation = target_microbatches / total_steps
+    rounded = (
+        math.ceil(ideal_accumulation)
+        if rounding_bias == 1
+        else math.floor(ideal_accumulation + rounding_bias)
+    )
+    return max(minimum_gradient_accumulation_steps, rounded)
 
 
 def round_steps_to_nearest_multiple(steps: int, multiple: int | None) -> int:

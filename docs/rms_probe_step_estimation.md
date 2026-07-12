@@ -56,9 +56,10 @@ rms_probe_final_target = 0.00008425384599385171
 rms_probe_scaling_policy = "piecewise_energy_v1"
 rms_probe_adjusted_steps_divisible_by = 100
 
-# Optional: reduce, but never increase, gradient accumulation so that the
-# adjusted step count times accumulation remains near this compute budget.
-rms_probe_gradient_accumulation_target_microbatches = 25500
+# Optional: adjust gradient accumulation so that the adjusted step count times
+# accumulation remains near the 4000-step, accumulation-6 reference budget.
+rms_probe_gradient_accumulation_target_microbatches = 24000
+rms_probe_gradient_accumulation_rounding_bias = 0.6
 rms_probe_min_gradient_accumulation_steps = 3
 
 lora_squeeze_start_dim = 36
@@ -71,7 +72,9 @@ lora_squeeze_rank_schedule = "geometric"
 
 `rms_probe_final_target` is the desired RMS at the end of production training. Unlike the probe-step reference RMS, it makes the final objective explicit. `rms_probe_target` remains recorded for reference and compatibility.
 
-The current coefficients were fitted to Anima, learning rate `6e-5`, constant AdamW, rank/alpha 9/3, start rank 36, four equal geometric squeezes, and gradient accumulation 4 through 6. The trainer enforces the rank and squeeze layout. Treat other learning rates, optimizers, datasets outside the observed size range, and accumulation below 4 as extrapolation; create a separately calibrated policy instead of silently reusing these coefficients.
+When a microbatch target is configured, the trainer divides it by the rounded production step count and rounds the resulting ideal accumulation. `rms_probe_gradient_accumulation_rounding_bias=0.5` is ordinary nearest rounding; the default `0.6` modestly favors more microbatches, while `1.0` always rounds upward. The result is not capped by the accumulation used for the probe, so a sufficiently short production run may select accumulation 7, 8, or higher. Small differences do not force an increase: a 24,000 target with 3,999 steps selects accumulation 6 at the default bias. If no microbatch target is configured, production retains the configured `gradient_accumulation_steps` unchanged.
+
+The current coefficients were fitted to Anima, learning rate `6e-5`, constant AdamW, rank/alpha 9/3, start rank 36, four equal geometric squeezes, and gradient accumulation 4 through 6. The trainer enforces the rank and squeeze layout. Treat other learning rates, optimizers, datasets outside the observed size range, and accumulation outside 4 through 6 as extrapolation; create a separately calibrated policy instead of silently reusing these coefficients.
 
 The result JSON records the complete probe curve, fitted energy slope, detected batches per epoch, predicted final RMS, original and adjusted gradient accumulation, and the selected policy.
 

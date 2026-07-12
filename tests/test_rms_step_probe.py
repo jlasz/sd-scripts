@@ -27,6 +27,7 @@ def make_args(**overrides):
         "rms_probe_curve_every_n_steps": 20,
         "rms_probe_adjusted_steps_divisible_by": None,
         "rms_probe_gradient_accumulation_target_microbatches": None,
+        "rms_probe_gradient_accumulation_rounding_bias": 0.6,
         "rms_probe_min_gradient_accumulation_steps": 1,
         "max_train_steps": 5000,
         "max_train_epochs": None,
@@ -122,13 +123,25 @@ class RMSStepProbeTest(unittest.TestCase):
 
         self.assertAlmostEqual(predicted, 8.4042434e-5, delta=1e-11)
 
-    def test_gradient_accumulation_compute_budget_thresholds(self):
-        self.assertEqual(choose_gradient_accumulation_steps(4400, 25500, 6), 6)
-        self.assertEqual(choose_gradient_accumulation_steps(5500, 25500, 6), 5)
-        self.assertEqual(choose_gradient_accumulation_steps(6500, 25500, 6), 4)
-        self.assertEqual(choose_gradient_accumulation_steps(9000, 25500, 6), 3)
+    def test_gradient_accumulation_uses_biased_nearest_microbatch_budget(self):
+        self.assertEqual(choose_gradient_accumulation_steps(3000, 24000, 6), 8)
+        self.assertEqual(choose_gradient_accumulation_steps(3500, 24000, 6), 7)
+        self.assertEqual(choose_gradient_accumulation_steps(3999, 24000, 6), 6)
+        self.assertEqual(choose_gradient_accumulation_steps(4500, 24000, 6), 5)
+        self.assertEqual(choose_gradient_accumulation_steps(5000, 24000, 6), 5)
+        self.assertEqual(choose_gradient_accumulation_steps(5500, 24000, 6), 4)
+        self.assertEqual(choose_gradient_accumulation_steps(6500, 24000, 6), 4)
         self.assertEqual(choose_gradient_accumulation_steps(6500, None, 6), 6)
-        self.assertEqual(choose_gradient_accumulation_steps(2000, 25500, 6), 6)
+
+    def test_gradient_accumulation_rounding_bias_is_configurable(self):
+        self.assertEqual(choose_gradient_accumulation_steps(5500, 24000, 6, rounding_bias=0.5), 4)
+        self.assertEqual(choose_gradient_accumulation_steps(5500, 24000, 6, rounding_bias=0.7), 5)
+        self.assertEqual(choose_gradient_accumulation_steps(3999, 24000, 6, rounding_bias=0.6), 6)
+        self.assertEqual(choose_gradient_accumulation_steps(4000, 24000, 6, rounding_bias=1.0), 6)
+        self.assertEqual(choose_gradient_accumulation_steps(3999, 24000, 6, rounding_bias=1.0), 7)
+
+    def test_gradient_accumulation_respects_configured_minimum(self):
+        self.assertEqual(choose_gradient_accumulation_steps(12000, 24000, 6, 3), 3)
 
     def test_adjusted_step_multiple_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "greater than 0"):
@@ -180,6 +193,12 @@ class RMSStepProbeTest(unittest.TestCase):
                 make_args(rms_probe_scaling_policy="piecewise_energy_v1", rms_probe_final_target=8e-5)
             )
         )
+
+    def test_gradient_accumulation_rounding_bias_must_be_bounded(self):
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            validate_rms_probe_configuration(
+                make_args(rms_probe_gradient_accumulation_rounding_bias=1.1)
+            )
 
     def test_probe_keeps_scheduler_horizon_but_stops_at_probe_step(self):
         probe_args = build_rms_probe_args(make_args())
