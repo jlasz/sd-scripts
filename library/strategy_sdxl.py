@@ -3,7 +3,8 @@ from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+from transformers import CLIPTextModel, CLIPTextModelWithProjection
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
 from library.strategy_base import TokenizeStrategy, TextEncodingStrategy, TextEncoderOutputsCachingStrategy
 
 
@@ -261,10 +262,14 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return [hidden_state1, hidden_state2, pool2]
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        infos: List,
+        captions: List[str],
     ):
         sdxl_text_encoding_strategy = text_encoding_strategy  # type: SdxlTextEncodingStrategy
-        captions = [info.caption for info in infos]
 
         if self.is_weighted:
             tokens_list, weights_list = tokenize_strategy.tokenize_with_weights(captions)

@@ -47,36 +47,94 @@ If you find this project helpful, please consider supporting its development via
 
 ### Change History
 
-- **Version 0.11.1 (2026-06-16):**
-    - Added support for torch.compile in Anima LoRA/LLLite training. [PR #2379](https://github.com/kohya-ss/sd-scripts/pull/2379)
-        - It seems to speed up training by about 20%. It requires Triton and MSVC compiler. For details, please refer to the [documentation](./docs/anima_torch_compile.md).
-    - Added 2D-only Qwen-Image VAE. [PR #2382](https://github.com/kohya-ss/sd-scripts/pull/2382)
-        - Based on the suggestion by woct0rdho in [issue #2369](https://github.com/kohya-ss/sd-scripts/issues/2369). Thanks to woct0rdho.
-        - Enabled by specifying `--qwen_image_vae_2d`. The weights are the same as the standard (3D) version.
-        - Expected to speed up latent pre-caching (training itself remains unchanged). For details, please refer to the [documentation](./docs/anima_train_network.md#memory-and-speed--メモリ速度関連).
-    - Added support for LLLite inpainting model training. [PR #2378](https://github.com/kohya-ss/sd-scripts/pull/2378)
-        - For details, please refer to the [documentation](./docs/anima_train_control_net_lllite.md).
-    - Added logging of timestep sampling settings and visualization of timesteps distribution. [PR #2384](https://github.com/kohya-ss/sd-scripts/pull/2384)
-        - Visualization makes it easier to understand how training is conducted at different timesteps.
-        - For details, please refer to the [documentation](./docs/anima_train_network.md#visualizing-the-timestep-distribution).
+- **Version 0.13.1 (2026-11-23):**
+    - Added `networks/lora_post_hoc_ema.py`, which merges several LoRA checkpoints of one training run into a single LoRA with an exponential moving average (Post-Hoc EMA), ported from Musubi Tuner. Averaging the checkpoints saved near the end of a training reduces the fluctuation of the weights, and the result may be more stable than the last checkpoint. For details, please refer to [the documentation](./docs/lora_post_hoc_ema.md). [PR #2510](https://github.com/kohya-ss/sd-scripts/pull/2510)
+    - Fixed a bug in single-process multi-GPU training (`--replica_devices`): when the number of batches per epoch was not a multiple of the number of GPUs, the GPUs did not run at the same time in some epochs (every other epoch with 2 GPUs), and those epochs were up to about two times slower. Only the speed was affected; the training results are not. [PR #2508](https://github.com/kohya-ss/sd-scripts/pull/2508)
 
-- **Version 0.11.0 (2026-06-12):**
-    - A major internal refactoring of the codebase has been performed to improve code quality and maintainability. [PR #2372](https://github.com/kohya-ss/sd-scripts/pull/2372)
-        - We have made efforts to minimize direct impact on users. For details and bug reports, please refer to [this discussion](https://github.com/kohya-ss/sd-scripts/discussions/2358).
+- **Version 0.13.0 (2026-11-21):**
+    - Added `--run_control` (experimental) to the LoRA training scripts. A running training can be observed and operated from outside, by scripts and AI agents. See the [documentation](./docs/run_control.md) for details. [PR #2494](https://github.com/kohya-ss/sd-scripts/pull/2494) [PR #2495](https://github.com/kohya-ss/sd-scripts/pull/2495) [PR #2496](https://github.com/kohya-ss/sd-scripts/pull/2496) [PR #2497](https://github.com/kohya-ss/sd-scripts/pull/2497) [PR #2498](https://github.com/kohya-ss/sd-scripts/pull/2498) [PR #2499](https://github.com/kohya-ss/sd-scripts/pull/2499) [PR #2500](https://github.com/kohya-ss/sd-scripts/pull/2500) [PR #2501](https://github.com/kohya-ss/sd-scripts/pull/2501)
+        - The state of the running training is written to plain JSON files in `<output_dir>/<output_name>_run`, so scripts and AI agents can observe the training without parsing the TensorBoard event files.
+            - `manifest.json`: resolved arguments, dataset summary, environment.
+            - `status.json`: current step, loss, learning rate, speed, ETA, VRAM, last outputs.
+            - `events.jsonl`: checkpoints, states, sample images, anomalies, end of the run with the error if it failed.
+            - `loss.jsonl`: the loss of each training sample with its image, timestep and resolution.
+        - `tools/analyze_run_loss.py` summarizes the per-sample loss by timestep, resolution and image, which helps to find images that are not learned well (e.g. a mismatch between the image and its caption).
+        - The running training also accepts commands, without waiting for the scheduled timing. They are sent with `tools/run_control_cli.py` (or any program which writes a JSON file).
+            - `sample`: generates sample images with the current weights (prompts of the prompt file, or new prompts if the text encoder is in memory).
+            - `save` / `save_state`: saves the model or the state.
+            - `stop`: stops the training after saving them.
+            - `pause` / `resume`: pauses the training to free the VRAM for a while (the base models are moved to CPU and back, the process stays). In replica training (`--replica_devices`), `pause` only stops the training: the models stay on the devices and the VRAM is not freed.
+        - A prompt with `--s 0` (0 steps) in the prompt file is a *reserved prompt*: it is skipped by the scheduled sampling, but its text encoder outputs are cached at the start, so it can be generated on demand (`sample --index`) even when the text encoder is not kept in memory.
+        - For Anima and MOSS-Image, `tools/run_control_sample_prompt.py` generates a sample image of a new prompt even when the text encoder is not kept in memory: it encodes the prompt with the text encoder in its own process (on CPU by default, so an error there does not affect the training) and sends the outputs to the training.
+        - For AI coding agents which start and watch a training for you, there is a short [guide](./docs/agent_guide.md) with the procedure and the pitfalls; let your agent read it.
+    - Added `--gradient_checkpointing_skip_blocks` (partial gradient checkpointing) to MOSS-Image and Anima training. The last N transformer blocks keep their activations instead of recomputing them in the backward pass, so spare VRAM can be converted into speed; the VRAM usage and the step time change linearly with N (`0`, the default, is the previous behavior). With the recent large models a larger batch size gives little throughput gain, so this is usually the better use of the VRAM left over on 24GB to 48GB GPUs. Measured with MOSS-Image LoRA training (about 1MP, batch size 1, bf16): 13.5GB / 1.29 s/step with `0` to 55GB / 0.93 s/step with `42` (all blocks), about 1GB and 8.6 ms per block; with `--compile` (ConvRot INT8) the cost per block drops to about 0.6GB. Anima: 6.5GB / 0.85 s/step with `0` to 19.9GB / 0.53 s/step with `28`. See the documentation of [MOSS-Image](./docs/moss_image_train_network.md#71-vram-usage-optimization--vram-使用量の最適化) and [Anima](./docs/anima_train_network.md#71-vram-usage-optimization--vram使用量の最適化) for the tables. [PR #2485](https://github.com/kohya-ss/sd-scripts/pull/2485)
+    - Added experimental single-process multi-GPU training (`--replica_devices`) for Anima and MOSS-Image LoRA training. One Python process drives a master and one replica per additional GPU without DDP, so no `accelerate launch --multi_gpu`, `torchrun` or NCCL / gloo is needed, and multi-GPU LoRA training also works on Windows. Requires `--cache_latents`, `--cache_text_encoder_outputs` and `--network_train_unet_only`; `train_batch_size` is per device as with DDP. For details, please refer to [the documentation](./docs/replica_training.md).
+        - For developers: `NetworkTrainer.create_network` (network creation from the arguments) and `NetworkTrainer.forward_backward` (one micro-step) are new overridable methods of `train_network.py`; the replica trainer (`library/replica_trainer.py`) is a mixin composed in front of the per-model trainer class.
+        - Fixed: a single-process training started with plain `python` (without `accelerate launch`) on a machine with several GPUs failed in the accelerator initialization (`Default process group has not been initialized`).
+    - Added `--text_encoder_blocks_to_swap` for MOSS-Image: streams the given number of the 32 text encoder layers from the CPU instead of keeping them on the GPU, so the text encoder outputs can be cached on GPUs with 8GB of VRAM (peak about 5GB with `28` and 3.5GB with `32` in bf16, 2.2GB with `32` and ConvRot INT8). Available in the training script and `tools/cache_text_encoder_outputs.py`. [PR #2478](https://github.com/kohya-ss/sd-scripts/pull/2478) Thanks to dskjal. [PR #2483](https://github.com/kohya-ss/sd-scripts/pull/2483)
+        - The text encoder layers are streamed with the same H2D-only offloader as `--block_swap_h2d_only` (it does not need to be specified; the weights stay on the CPU, the next layer is prefetched while the current one runs), which now supports blocks of different shapes, such as the linear / full attention layers of Qwen3.5-9B.
+    - Added `--svd_method qr` to `networks/resize_lora.py`. It computes the exact SVD of the LoRA weights via QR decomposition without merging `lora_up @ lora_down`, which is much faster (more than 100 times on an SDXL LoRA) and has no randomness of `svd_lowrank`. If `--new_rank` is larger than the original rank, the output is padded to `--new_rank`. The default `merged` keeps the previous behavior. [PR #2482](https://github.com/kohya-ss/sd-scripts/pull/2482) Thanks to woct0rdho. [PR #2484](https://github.com/kohya-ss/sd-scripts/pull/2484)
+    - Anima: the number of DiT blocks is now inferred from the checkpoint, so variants which differ from Anima-Preview only in the number of blocks, such as the community [Anima-2.9B](https://huggingface.co/Gazingstars123/Anima-2.9B) (40 blocks), can be used for LoRA training and inference. Please note that these variants are not tested regularly. [PR #2418](https://github.com/kohya-ss/sd-scripts/pull/2418) Thanks to gazingstars123. [PR #2486](https://github.com/kohya-ss/sd-scripts/pull/2486) Thanks to davrens101. [PR #2502](https://github.com/kohya-ss/sd-scripts/pull/2502)
 
-- **Version 0.10.6 (2026-06-12):**
-    - Stable version before refactoring merge.
+- **Version 0.12.3 (2026-10-26):**
+    - Added `--timestep_sampling truncated_logit_normal` for FLUX.1, Anima, HunyuanImage-2.1 and MOSS-Image training: the logit-normal distribution (`--logit_mean` / `--logit_std`) on the discrete training grid, truncated at `--timestep_cutoff` (default 0.95) and rescaled, with a `--timestep_uniform_ratio` (default 0.01) share of uniform samples. With `--logit_mean -1.09 --logit_std 0.95 --discrete_flow_shift 1.0`, this reproduces the timestep schedule of the MOSS-Image pre-training exactly (previously the truncation and the uniform samples were not reproduced). [PR #2471](https://github.com/kohya-ss/sd-scripts/pull/2471)
+        - The per-subset `timestep_sampling.offset` now also applies to `truncated_logit_normal` and to `sigma` with `--weighting_scheme logit_normal` (a positive offset biases toward higher noise, as in the other modes). See [the documentation](./docs/timestep_sampling_offset.md).
+    - MOSS-Image: the ConvRot INT8 Linear layers are now included in `--compile`. The fused Triton kernels are registered as `torch.library` custom ops, so the compiled blocks no longer break at every quantized Linear layer and `--compile` speeds up `--convrot_int8` training too. [PR #2473](https://github.com/kohya-ss/sd-scripts/pull/2473)
+        - The backward of the INT8 Linear layers is also faster: the weight is dequantized and rotated back in one kernel instead of rotating the activations after the GEMM. [PR #2474](https://github.com/kohya-ss/sd-scripts/pull/2474)
+        - The autotune configs of the INT8 GEMM now include tiles for Ampere (RTX 30xx) GPUs, where the upstream configs reached only ~40% of the hardware INT8 throughput, and a Blackwell (RTX 50xx / RTX PRO) config. [PR #2475](https://github.com/kohya-ss/sd-scripts/pull/2475)
 
-- **Version 0.10.5 (2026-05-08):**
-    - Support for transformers version 5 and later has been added. Thanks to marcus165090-spec for [PR #2315](https://github.com/kohya-ss/sd-scripts/pull/2315) (followed by [PR #2316](https://github.com/kohya-ss/sd-scripts/pull/2316)).
-        - The `transformers` version in `requirements.txt` remains 4.x, but it also works with 5.x. If you use 5.x for any reason, please also update `diffusers` to the latest version.
-    - Support for ControlNet-LLLite training for Anima has been added. Thanks to [PR #2317](https://github.com/kohya-ss/sd-scripts/pull/2317).
-        - For details, please refer to the [documentation](./docs/anima_train_control_net_lllite.md).
+- **Version 0.12.2 (2026-10-20):**
+    - Added H2D-only block swap (`--block_swap_h2d_only`) for LoRA training, ported from Musubi Tuner. The frozen base weights are kept on the CPU and only copied Host→Device, which removes the Device→Host transfer of the classic block swap and improves the training speed. Supported for FLUX.1 / Chroma, Lumina Image 2.0, HunyuanImage-2.1, Anima and MOSS-Image (not for SD3). `--gradient_checkpointing` is required. For details, please refer to [the documentation](./docs/block_swap.md). [PR #2467](https://github.com/kohya-ss/sd-scripts/pull/2467)
+        - `--block_swap_ring_size` (default 2) sets the number of GPU buffers for the streamed blocks, and `--use_pinned_memory_for_block_swap` keeps the CPU copies in pinned memory for faster transfers.
+        - For developers: `enable_block_swap` of the models now takes a `BlockSwapConfig` instead of a device, and `submit_move_blocks` of the offloader is renamed to `submit_move_blocks_forward`, the same as Musubi Tuner.
+    - The Text Encoder outputs of multiple caption candidates (`enable_multiline_caption` with separator lines) can now be cached for MOSS-Image. All candidates are encoded and stored in one cache file, and one of them is chosen randomly at each step. [PR #2466](https://github.com/kohya-ss/sd-scripts/pull/2466)
+        - The processed caption texts are stored in the cache files, so the cache is rebuilt automatically when captions (or `caption_prefix` / `caption_suffix`) are changed. The cache files created with version 0.12.1 are still valid for images with a single caption.
+        - The cache size and the caching time are multiplied by the number of candidates. Other models still cannot cache the Text Encoder outputs when some captions have multiple candidates.
+        - `tools/cache_text_encoder_outputs.py` now stops with an error for multiple caption candidates with models that do not support them (previously only the first candidate was cached silently).
 
-- **Version 0.10.4 (2026-05-07):**
-    - Improved compatibility with Intel GPUs. Thanks to WhitePr for [PR #2307](https://github.com/kohya-ss/sd-scripts/pull/2307).
-    - Support for training inpainting models for SD 1.5/SDXL has been added. Thanks to allanoepping for [PR #2309](https://github.com/kohya-ss/sd-scripts/pull/2309) (followed by [PR #2318](https://github.com/kohya-ss/sd-scripts/pull/2318)).
-        - For details, please refer to the [documentation](./docs/inpainting_training.md).
+- **Version 0.12.1 (2026-10-18):**
+    - Added support for LoRA training of [MOSS-Image](https://github.com/OpenMOSS/MOSS-Image) (OpenMOSS), a 5B DiT with the Qwen3.5-9B text encoder and the FLUX.2 VAE. [PR #2458](https://github.com/kohya-ss/sd-scripts/pull/2458), [PR #2459](https://github.com/kohya-ss/sd-scripts/pull/2459), [PR #2460](https://github.com/kohya-ss/sd-scripts/pull/2460), [PR #2461](https://github.com/kohya-ss/sd-scripts/pull/2461)
+        - `moss_image_train_network.py` trains LoRA (and LoHa / LoKr) for the DiT and optionally for the text encoder. The official diffusers-format shards and the ComfyUI single-file checkpoints can be loaded. For details, please refer to [the documentation](./docs/moss_image_train_network.md).
+        - ConvRot INT8 quantization of the base weights (`--convrot_int8` for the DiT, `--convrot_int8_text_encoder` for the text encoder, ported from Musubi Tuner) is available as an alternative to fp8. The ComfyUI pre-quantized `*_int8_convrot.safetensors` files are detected automatically. The fused int8 kernels require `triton` (`triton-windows` on Windows).
+        - The DiT LoRA can be used in ComfyUI without conversion. `moss_image_minimal_inference.py` is also available for inference with LoRA.
+        - `tools/cache_latents.py` and `tools/cache_text_encoder_outputs.py` support MOSS-Image with `--moss_image`.
+        - The LoRA module is the new generic `networks.lora_generic` (regex-based module selection, `network_reg_dims` / `network_reg_lrs`, the same as `networks.lora_anima`). It is expected to be the base for other architectures in the future.
+    - Added `enable_multiline_caption` subset option (`--enable_multiline_caption`) to use captions containing line breaks as they are, for models with LLM-based text encoders (Anima, Lumina, HunyuanImage, etc.).
+        - Lines starting with `multiline_caption_separator` (default `---===---`) separate multiple caption candidates for one image, and one candidate is chosen randomly at each step. In metadata files for fine tuning, `caption` can also be a list of strings. For details, please refer to [the dataset config documentation](./docs/config_README-en.md#captions-with-line-breaks-and-multiple-caption-candidates-enable_multiline_caption--true).
+        - In `.txt` sample prompt files, `\n` (backslash + n) is now converted to a line break.
+        - Fixed `caption_prefix` / `caption_suffix` being added only to the first / last line of multi-line captions (with `enable_wildcard`, the prefix was attached only to the first line and the suffix only to the last line; without it, the suffix was lost).
+    - Fixed `caption_prefix` / `caption_suffix`, `secondary_separator` and the first-line truncation of multi-line captions not being applied when caching Text Encoder outputs (`--cache_text_encoder_outputs`); the raw caption was encoded. [Issue #2453](https://github.com/kohya-ss/sd-scripts/issues/2453)
+        - If you use these options with `--cache_text_encoder_outputs_to_disk`, delete the existing cache files (`*_te.npz` etc.) so that they are re-created with the processed captions.
+        - `enable_wildcard` cannot be applied to cached outputs (the caption is encoded as is); a warning is now shown in that case.
+        - For custom caching strategies: `TextEncoderOutputsCachingStrategy.cache_batch_outputs` now receives the processed captions as an additional `captions` argument.
+    - When a custom LR scheduler is specified with `--lr_scheduler_type`, the total number of training steps and the number of warmup steps computed by sd-scripts are now passed to the scheduler as `num_training_steps` and `num_warmup_steps`. [Issue #2444](https://github.com/kohya-ss/sd-scripts/issues/2444)
+        - They are passed only when the scheduler's constructor has arguments with these exact names, and values given explicitly with `--lr_scheduler_args` take priority. Schedulers with differently named arguments (e.g. `total_steps`) are not affected; specify them with `--lr_scheduler_args` as before.
+        - Note that a custom scheduler that has `num_training_steps` but was used without specifying it in `--lr_scheduler_args` previously ran with its default value, and now uses the actual number of training steps. Similarly, `--lr_warmup_steps` is now passed to a scheduler that has `num_warmup_steps` (previously it caused an error).
+
+- **Version 0.12.0 (2026-09-24):**
+    - Added support for Windows on ARM64 (e.g. NVIDIA RTX Spark PCs). [PR #2430](https://github.com/kohya-ss/sd-scripts/pull/2430), [PR #2431](https://github.com/kohya-ss/sd-scripts/pull/2431), [PR #2433](https://github.com/kohya-ss/sd-scripts/pull/2433)
+        - `opencv-python` is now optional (a Pillow/NumPy fallback is used when it is missing), and `requirements.txt` selects the packages that have Windows ARM64 wheels automatically. For details, please refer to [Installing without OpenCV / Windows on ARM64](#installing-without-opencv--windows-on-arm64).
+        - `transformers`, `schedulefree` and `safetensors` in `requirements.txt` have been updated to versions that provide Windows ARM64 wheels.
+    - Updated the dependencies in `requirements.txt`: `transformers` 4.57.6 -> 5.5.4, `diffusers` 0.32.1 -> 0.40.0, `accelerate` 1.6.0 -> 1.15.0, `huggingface-hub` 0.34.3 -> 1.32.0. [PR #2436](https://github.com/kohya-ss/sd-scripts/pull/2436)
+        - This is mainly a security maintenance update (the 4.x line of `transformers` and `diffusers` < 0.38 no longer receive fixes). The previous versions of the libraries still work with this release, so you do not have to update them immediately, but it is recommended to run `pip install --upgrade -r requirements.txt` at your earliest convenience.
+        - `diffusers` 0.40 requires PyTorch 2.6 or later (PyTorch 2.6.0 or later has been the requirement of sd-scripts already). CI now tests with PyTorch 2.6.0 and 2.8.0.
+        - In `transformers` 5.x, `CLIPTokenizer` no longer applies the `ftfy` text normalization of the original CLIP tokenizer (straightening curly quotes, converting full-width characters, etc.). sd-scripts now applies it itself, so tokenization is unchanged from previous versions.
+        - Text encoder outputs, VAE outputs and the noise schedulers were verified to be identical to the previous versions with the local regression tests in `tests/local`.
+        - `diffusers` 0.40 prints a spurious warning "There are modules in AutoencoderKL that should be kept in float32: [] ..." on every `.to(dtype)` call (a bug in diffusers: the check fires even when the list is empty). sd-scripts suppresses this warning when the list is empty.
+    - Added support for `transformers` 5.6 and later, and updated `transformers` in `requirements.txt` to 5.17.0. [PR #2437](https://github.com/kohya-ss/sd-scripts/pull/2437)
+        - `transformers` 5.6 changed the internal structure of `CLIPTextModel` (the `text_model` submodule was removed). sd-scripts now wraps the model so that the checkpoint keys, the LoRA weight names of the text encoders (`lora_te_text_model_...`) and `text_encoder.text_model.*` access stay the same as before. Nothing changes for `transformers` < 5.6, where the wrapper is not applied.
+        - `transformers` 5.6 also switched the attention implementation of T5 (T5-XXL of FLUX.1 / SD3, byT5 of HunyuanImage) to SDPA, which should be faster and use less memory. The bf16/fp16 outputs of T5 differ very slightly from previous versions (cosine similarity ≈ 0.998 for T5-XXL, the accuracy against fp32 is the same). This may change generated images or trained weights in minor details, and cached text encoder outputs from previous versions are still usable. The outputs of the other text encoders are identical.
+        - As above, the previous versions of `transformers` still work, but updating with `pip install --upgrade -r requirements.txt` is recommended.
+    - Added OFTv2 and BOFT network modules (`networks.oft_v2`, `networks.boft`) for SD1.x / SD2.x / SDXL training. [PR #2357](https://github.com/kohya-ss/sd-scripts/pull/2357)
+        - Orthogonal fine-tuning adapters following the PEFT implementation. Weights in PEFT format can also be loaded. Thanks to umisetokikaze.
+        - Note that `--network_dim` means the block size for these modules. For details, please refer to the [documentation](./docs/train_network_oft_boft.md).
+    - Added per-subset timestep sampling offset (`custom_attributes.timestep_sampling.offset`) for FLUX.1 and Anima LoRA training. [PR #2401](https://github.com/kohya-ss/sd-scripts/pull/2401) Thanks to okdsf.
+        - Shifts the timestep sampling distribution of each dataset subset toward lower- or higher-noise timesteps. For details, please refer to the [documentation](./docs/timestep_sampling_offset.md).
+    - Added `--show_timesteps_offset` to preview the timestep distribution with the offset applied when using `--show_timesteps`. [PR #2410](https://github.com/kohya-ss/sd-scripts/pull/2410)
+        - The documentation also describes how the offset behaves with `shift` / `flux_shift` timestep sampling.
+    - Removed `gen_img_diffusers.py`, the old image generation script for SD1.x / SD2.x. It had not worked for a while (it depended on a function removed by the refactoring) and `gen_img.py` supports everything it did except the experimental CLIP / VGG16 guidance. Please use `gen_img.py` instead (see [gen_img_README.md](./docs/gen_img_README.md)). The file is still available in the previous releases. [PR #2439](https://github.com/kohya-ss/sd-scripts/pull/2439)
+    - Fixed the `dpmsolver` and `dpmsingle` samplers of `--sample_sampler` (sample image generation during training) and `--sampler` of `gen_img.py` / `sdxl_gen_img.py`, which failed with an error on recent versions of `diffusers`. [PR #2438](https://github.com/kohya-ss/sd-scripts/pull/2438)
+        - The `lms` / `k_lms` samplers require the `scipy` package, which is not included in `requirements.txt`. A clear error message is now shown at startup (instead of at the first sample generation) when `scipy` is missing. Please run `pip install scipy` to use them.
 
 ### Supported Models
 
@@ -87,6 +145,7 @@ If you find this project helpful, please consider supporting its development via
 * **LUMINA**
 * **HunyuanImage-2.1**
 * **Anima**
+* **MOSS-Image**
 
 ### Features
 
@@ -104,11 +163,14 @@ If you find this project helpful, please consider supporting its development via
 * [LoRA Training Overview](./docs/train_network.md)
 * [Dataset config](./docs/config_README-en.md) / [Japanese version](./docs/config_README-ja.md)
 * [Advanced Training](./docs/train_network_advanced.md)
+* [OFTv2 / BOFT Training](./docs/train_network_oft_boft.md)
 * [SDXL Training](./docs/sdxl_train_network.md)
 * [SD3 Training](./docs/sd3_train_network.md)
 * [FLUX.1 Training](./docs/flux_train_network.md)
 * [LUMINA Training](./docs/lumina_train_network.md)
 * [HunyuanImage-2.1 Training](./docs/hunyuan_image_train_network.md)
+* [Anima Training](./docs/anima_train_network.md)
+* [MOSS-Image Training](./docs/moss_image_train_network.md)
 * [Fine-tuning](./docs/fine_tune.md)
 * [Textual Inversion Training](./docs/train_textual_inversion.md)
 * [ControlNet-LLLite Training](./docs/train_lllite_README.md) / [Japanese version](./docs/train_lllite_README-ja.md)
@@ -116,6 +178,11 @@ If you find this project helpful, please consider supporting its development via
 * [Validation](./docs/validation.md)
 * [Masked Loss Training](./docs/masked_loss_README.md) / [Japanese version](./docs/masked_loss_README-ja.md)
 * [Inpainting Training](./docs/inpainting_training.md)
+* [Block Swap (CPU Offloading)](./docs/block_swap.md)
+* [Single-Process Multi-GPU Training (Replica Training)](./docs/replica_training.md)
+* [LoRA Post-Hoc EMA Merging](./docs/lora_post_hoc_ema.md)
+* [Observing and Controlling a Running Training (Run Control)](./docs/run_control.md)
+* [Guide for AI Agents Operating a Training](./docs/agent_guide.md) (give this to your AI coding agent when it starts and watches a training)
 
 ### Other Documentation (English and Japanese)
 
@@ -213,6 +280,22 @@ The file does not contain requirements for PyTorch. Because the version of PyTor
 The scripts are tested with PyTorch 2.6.0. PyTorch 2.6.0 or later is required.
 
 For RTX 50 series GPUs, PyTorch 2.8.0 with CUDA 12.8/12.9 should be used. `requirements.txt` will work with this version.
+
+### Installing without OpenCV / Windows on ARM64
+
+`opencv-python` is listed in `requirements.txt`, but the core training / dataset pipeline only uses a small subset of OpenCV (mainly `cv2.resize`, `cv2.cvtColor`, and a debug-only `cv2.imshow`). When `opencv-python` is not available, a lightweight Pillow/NumPy fallback under `library/_cv2_stub` is automatically registered as `cv2`, so existing scripts continue to work. If you would rather avoid the large OpenCV install, simply uninstall it after installing the requirements:
+
+```bash
+pip uninstall opencv-python
+```
+
+On Windows on ARM64 (e.g. NVIDIA RTX Spark PCs), `opencv-python` has no prebuilt wheel, so `requirements.txt` skips it automatically through an environment marker and the usual `pip install --upgrade -r requirements.txt` works as is. For the same reason `tensorboardX` is installed instead of `tensorboard` on that platform (TensorBoard 2.x depends on `grpcio`, which has no Windows ARM64 wheel). Logging with `--log_with tensorboard` works unchanged through `tensorboardX`; view the logs with TensorBoard on another machine.
+
+Note that:
+
+- The default install with OpenCV remains the recommended path. The fallback reproduces OpenCV's `INTER_AREA` and `INTER_LINEAR` resizing (the modes the dataset pipeline uses by default) in NumPy, so training results match up to rounding, but it is slower than OpenCV (roughly 0.1 s per 24-megapixel image). `INTER_CUBIC` / `INTER_LANCZOS4` go through Pillow and differ slightly.
+- The following tools still require real `opencv-python` and will exit with a clear message when it is missing: `tools/canny.py`, `tools/detect_face_rotate.py`, and the ControlNet `canny` preprocessor used by `gen_img.py` / `sdxl_gen_img.py`.
+- Debug-only features such as `cv2.imshow` during dataset inspection fall back to Pillow's default image viewer (`PIL.Image.show`), and `cv2.waitKey` blocks on `input()` in the terminal so you can page through images one at a time.
 
 ### xformers installation (optional)
 

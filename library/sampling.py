@@ -21,11 +21,13 @@ module.
 """
 
 import argparse
+import contextlib
+import importlib.util
 import json
 import os
 import re
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional, Union
 
 import toml
 import torch
@@ -69,12 +71,31 @@ SCHEDULER_TIMESTEPS = 1000
 SCHEDLER_SCHEDULE = "scaled_linear"
 
 
+def check_sampler_requirements(sample_sampler: str) -> None:
+    """Raise a clear ``ImportError`` if an optional dependency of the sampler is missing.
+
+    ``lms`` / ``k_lms`` (``LMSDiscreteScheduler``) need ``scipy``, which is not in ``requirements.txt``.
+    Without this check the failure surfaces only when the scheduler is built, i.e. at the first sample
+    generation after the models are loaded.
+    """
+    if sample_sampler in ("lms", "k_lms") and importlib.util.find_spec("scipy") is None:
+        raise ImportError(
+            f"The sampler '{sample_sampler}' (LMSDiscreteScheduler) requires the `scipy` package, which is not included in"
+            " requirements.txt. Please run `pip install scipy`, or choose another sampler (e.g. euler, dpmsolver++)."
+            f" / サンプラー '{sample_sampler}' (LMSDiscreteScheduler) には requirements.txt に含まれない `scipy` パッケージが必要です。"
+            "`pip install scipy` を実行するか、他のサンプラー（euler、dpmsolver++ など）を指定してください。"
+        )
+
+
 def get_my_scheduler(
     *,
     sample_sampler: str,
     v_parameterization: bool,
 ):
+    check_sampler_requirements(sample_sampler)
+
     sched_init_args = {}
+    has_steps_offset = True
     if sample_sampler == "ddim":
         scheduler_cls = DDIMScheduler
     elif sample_sampler == "ddpm":  # ddpmはおかしくなるのでoptionから外してある
@@ -90,8 +111,12 @@ def get_my_scheduler(
     elif sample_sampler == "dpmsolver" or sample_sampler == "dpmsolver++":
         scheduler_cls = DPMSolverMultistepScheduler
         sched_init_args["algorithm_type"] = sample_sampler
+        if sample_sampler == "dpmsolver":
+            # diffusers rejects the default final_sigmas_type="zero" for the (non-++) dpmsolver algorithm
+            sched_init_args["final_sigmas_type"] = "sigma_min"
     elif sample_sampler == "dpmsingle":
         scheduler_cls = DPMSolverSinglestepScheduler
+        has_steps_offset = False  # DPMSolverSinglestepScheduler has no steps_offset argument
     elif sample_sampler == "heun":
         scheduler_cls = HeunDiscreteScheduler
     elif sample_sampler == "dpm_2" or sample_sampler == "k_dpm_2":
@@ -103,13 +128,14 @@ def get_my_scheduler(
 
     if v_parameterization:
         sched_init_args["prediction_type"] = "v_prediction"
+    if has_steps_offset:
+        sched_init_args["steps_offset"] = 1
 
     scheduler = scheduler_cls(
         num_train_timesteps=SCHEDULER_TIMESTEPS,
         beta_start=SCHEDULER_LINEAR_START,
         beta_end=SCHEDULER_LINEAR_END,
         beta_schedule=SCHEDLER_SCHEDULE,
-        steps_offset=1,
         **sched_init_args,
     )
 
@@ -126,7 +152,7 @@ def sample_images(*args, **kwargs):
 
 
 def line_to_prompt_dict(line: str) -> dict:
-    # subset of gen_img_diffusers
+    # subset of gen_img.py
     prompt_args = line.split(" --")
     prompt_dict = {}
     prompt_dict["prompt"] = prompt_args[0]
@@ -149,8 +175,8 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"s (\d+)", parg, re.IGNORECASE)
-            if m:  # steps
-                prompt_dict["sample_steps"] = max(1, min(1000, int(m.group(1))))
+            if m:  # steps. 0 makes the prompt a reserved one, see `is_reserved_prompt`
+                prompt_dict["sample_steps"] = max(0, min(1000, int(m.group(1))))
                 continue
 
             m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
@@ -212,6 +238,12 @@ def line_to_prompt_dict(line: str) -> dict:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
 
+    # `\n` (backslash + n) in line-format prompts is converted to a line break, for the models whose text encoders
+    # are sensitive to line breaks. .toml / .json (dict) prompts can contain real line breaks, so they are not converted
+    for key in ("prompt", "negative_prompt"):
+        if key in prompt_dict and prompt_dict[key] is not None:
+            prompt_dict[key] = prompt_dict[key].replace("\\n", "\n")
+
     return prompt_dict
 
 
@@ -244,6 +276,241 @@ def load_prompts(prompt_file: str) -> List[Dict]:
     return prompts
 
 
+# region shared by the sampling functions of all models
+
+# When not None, the sampling functions generate these prompts regardless of the step / epoch and the prompt file.
+# The training is single-threaded around the sampling, so plain module variables are enough.
+_forced_prompts: Optional[List[Dict]] = None
+_saved_sample_collectors: List[List[str]] = []
+
+# The file names of the forced samples use numbers from this, not to overwrite the scheduled samples of the same step
+FORCED_PROMPT_ENUM_OFFSET = 100
+
+
+def should_sample_images(args: argparse.Namespace, epoch: Optional[int], steps: int) -> bool:
+    """Whether to generate sample images now. `epoch` is None for the call at each step, the epoch number at the epoch end."""
+    if _forced_prompts is not None:
+        return True
+    if steps == 0:
+        return bool(args.sample_at_first)
+    if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
+        return False
+    if args.sample_every_n_epochs is not None:
+        # sample_every_n_steps is ignored
+        return epoch is not None and epoch % args.sample_every_n_epochs == 0
+    return steps % args.sample_every_n_steps == 0 and epoch is None  # divisible, and not the end of an epoch
+
+
+def has_sample_prompts(args: argparse.Namespace) -> bool:
+    if _forced_prompts is not None:
+        return True
+    return args.sample_prompts is not None and os.path.isfile(args.sample_prompts)
+
+
+def is_reserved_prompt(prompt_dict: Dict) -> bool:
+    """A prompt whose number of steps is 0 (`--s 0`) is a reserved prompt.
+
+    It is not generated by the scheduled sampling, but it is in the prompt file, so its text encoder outputs are cached
+    at the start of the training together with the other prompts (`load_prompts` returns it). A sampling request from
+    outside can therefore use it by its index, even if the text encoder is not in memory any more.
+    """
+    return prompt_dict.get("sample_steps") == 0
+
+
+def get_sample_prompts(args: argparse.Namespace) -> List[Dict]:
+    """The prompts to generate now: the prompt file without the reserved prompts, or the forced prompts."""
+    if _forced_prompts is not None:
+        return [dict(p) for p in _forced_prompts]
+    return [p for p in load_prompts(args.sample_prompts) if not is_reserved_prompt(p)]
+
+
+def notify_sample_saved(path: str) -> None:
+    """The sampling functions call this for each saved image."""
+    for collector in _saved_sample_collectors:
+        collector.append(path)
+
+
+@contextlib.contextmanager
+def collect_saved_samples():
+    """Yields a list to which the paths of the images saved in the context are added."""
+    collector: List[str] = []
+    _saved_sample_collectors.append(collector)
+    try:
+        yield collector
+    finally:
+        for i, c in enumerate(_saved_sample_collectors):
+            if c is collector:
+                del _saved_sample_collectors[i]
+                break
+
+
+@contextlib.contextmanager
+def force_sample_prompts(prompts: List[Dict]):
+    """In the context, the sampling functions generate `prompts` (prompt dicts) at any step."""
+    global _forced_prompts
+    previous = _forced_prompts
+    _forced_prompts = prompts
+    try:
+        yield
+    finally:
+        _forced_prompts = previous
+
+
+def build_forced_prompts(
+    args: argparse.Namespace,
+    prompts: Optional[List[Union[str, Dict]]] = None,
+    indices: Optional[List[int]] = None,
+    overrides: Optional[Dict] = None,
+) -> List[Dict]:
+    """Build the prompt dicts for a sampling request from outside of the training schedule.
+
+    Args:
+        prompts: prompt lines in the syntax of the prompt file (e.g. "a cat --w 1024 --h 1024 --d 1"), or prompt dicts.
+        indices: indices of the prompts in the prompt file (`--sample_prompts`), starting from 0.
+        overrides: values to set to every prompt, with the keys of the prompt dict (`width`, `height`, `seed`,
+            `sample_steps`, `scale`, `negative_prompt`, ...). None values are ignored.
+
+    If neither `prompts` nor `indices` is given, the prompts of the scheduled sampling are used: all prompts in the
+    prompt file except the reserved ones (`--s 0`). A reserved prompt is selected by its index, and is generated with
+    the default number of steps of the model unless `sample_steps` is in `overrides`.
+    Raises ValueError if the request is not valid.
+    """
+    result: List[Dict] = []
+
+    if indices or not prompts:
+        if args.sample_prompts is None or not os.path.isfile(args.sample_prompts):
+            raise ValueError("the prompt file (--sample_prompts) is required unless prompts are given")
+        file_prompts = load_prompts(args.sample_prompts)
+        if indices:
+            for index in indices:
+                if not isinstance(index, int) or isinstance(index, bool) or not (0 <= index < len(file_prompts)):
+                    raise ValueError(f"index {index} is out of range. the prompt file has {len(file_prompts)} prompts")
+                result.append(dict(file_prompts[index]))
+        else:
+            result.extend(p for p in file_prompts if not is_reserved_prompt(p))
+            if len(result) == 0:
+                raise ValueError("the prompt file has no prompts for the scheduled sampling. select the prompts by index")
+
+    for prompt in prompts or []:
+        if isinstance(prompt, str):
+            result.append(line_to_prompt_dict(prompt))
+        elif isinstance(prompt, dict):
+            result.append(dict(prompt))
+        else:
+            raise ValueError(f"a prompt must be a string or a dict: {prompt!r}")
+
+    for i, prompt_dict in enumerate(result):
+        if overrides:
+            if not isinstance(overrides, dict):
+                raise ValueError("overrides must be a dict")
+            prompt_dict.update({k: v for k, v in overrides.items() if v is not None})
+        if is_reserved_prompt(prompt_dict):
+            del prompt_dict["sample_steps"]  # 0 steps cannot be generated: use the default of the model
+        prompt_dict["enum"] = FORCED_PROMPT_ENUM_OFFSET + i
+    return result
+
+
+def verify_forced_prompts_are_cached(prompts: List[Dict], cached_outputs: Dict) -> None:
+    """Raises ValueError if a prompt or a negative prompt is not in the cached text encoder outputs.
+
+    When the text encoder outputs of the prompt file were cached at the start of the training, the text encoder may not
+    be in memory any more, and the sampling functions cannot encode other prompts (some of them fail in the middle of
+    the sampling). `cached_outputs` is the dict of the cached outputs, whose keys are the prompts.
+    """
+    for prompt_dict in prompts:
+        texts = [("prompt", prompt_dict.get("prompt", ""))]
+        if prompt_dict.get("negative_prompt") is not None:
+            texts.append(("negative prompt", prompt_dict["negative_prompt"]))
+        for kind, text in texts:
+            if text not in cached_outputs:
+                raise ValueError(
+                    f"the {kind} `{text}` is not in the prompt file (--sample_prompts). Only the prompts and the negative prompts"
+                    " of the prompt file can be used, because the text encoder outputs are cached"
+                )
+
+
+# Text encoder outputs of prompts which are encoded outside of the training process (tools/run_control_sample_prompt.py)
+# and sent to it with a sampling request. The file is a safetensors file: the tensors of the i-th text have the keys
+# `<i>.<j>` (the j-th element of the return value of `TextEncodingStrategy.encode_tokens`), and the texts are in the metadata.
+PROMPT_TE_OUTPUTS_FORMAT = "sd-scripts-prompt-te-outputs"
+PROMPT_TE_OUTPUTS_VERSION = "1"
+
+
+def save_prompt_te_outputs(path: str, outputs: Dict[str, List[torch.Tensor]]) -> None:
+    """Save the text encoder outputs of prompts. The keys of `outputs` are the texts (prompts and negative prompts)."""
+    from safetensors.torch import save_file
+
+    texts = list(outputs.keys())
+    tensors = {}
+    for i, text in enumerate(texts):
+        for j, tensor in enumerate(outputs[text]):
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"the text encoder outputs must be tensors: {type(tensor)}")
+            tensors[f"{i}.{j}"] = tensor.detach().to("cpu").contiguous()
+    metadata = {
+        "format": PROMPT_TE_OUTPUTS_FORMAT,
+        "version": PROMPT_TE_OUTPUTS_VERSION,
+        "texts": json.dumps(texts, ensure_ascii=False),
+    }
+    save_file(tensors, path, metadata=metadata)
+
+
+def load_prompt_te_outputs(path: str) -> Dict[str, List[torch.Tensor]]:
+    """Load the file written by `save_prompt_te_outputs`. The tensors are on CPU. Raises ValueError if the file is not valid."""
+    from safetensors import safe_open
+
+    try:
+        outputs: Dict[str, List[torch.Tensor]] = {}
+        with safe_open(path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+            if metadata.get("format") != PROMPT_TE_OUTPUTS_FORMAT or metadata.get("version") != PROMPT_TE_OUTPUTS_VERSION:
+                raise ValueError(f"not a file of text encoder outputs of prompts (version {PROMPT_TE_OUTPUTS_VERSION})")
+            texts = json.loads(metadata.get("texts", "null"))
+            if not isinstance(texts, list) or not all(isinstance(text, str) for text in texts):
+                raise ValueError("the texts in the metadata are not valid")
+            keys = set(f.keys())
+            for i, text in enumerate(texts):
+                tensors = []
+                while f"{i}.{len(tensors)}" in keys:
+                    tensors.append(f.get_tensor(f"{i}.{len(tensors)}"))
+                outputs[text] = tensors
+        return outputs
+    except ValueError as e:
+        raise ValueError(f"failed to load the text encoder outputs {path}: {e}")
+    except Exception as e:  # OSError, SafetensorError, ...
+        raise ValueError(f"failed to load the text encoder outputs {path}: {type(e).__name__}: {e}")
+
+
+def verify_prompt_te_outputs(outputs: Dict[str, List[torch.Tensor]], reference: List[torch.Tensor]) -> None:
+    """Raises ValueError if the text encoder outputs from outside do not have the same structure as `reference`.
+
+    `reference` is the outputs of a prompt which were encoded in the training process. Outputs of another model or of a
+    broken file would raise an error in the middle of the sampling, which ends the training, so they are rejected here.
+    The length of the sequence is not compared, because it depends on the prompt in some models.
+    """
+    for text, tensors in outputs.items():
+        if len(tensors) != len(reference):
+            raise ValueError(f"the text encoder outputs of `{text}` have {len(tensors)} tensors, expected {len(reference)}")
+        for j, (tensor, ref) in enumerate(zip(tensors, reference)):
+            ref = torch.as_tensor(ref)
+            name = f"the tensor {j} of the text encoder outputs of `{text}`"
+            if tensor.ndim != ref.ndim or tensor.ndim == 0:
+                raise ValueError(f"{name} has {tensor.ndim} dimensions, expected {ref.ndim}")
+            if tensor.shape[0] != ref.shape[0]:
+                raise ValueError(f"{name} has the batch size {tensor.shape[0]}, expected {ref.shape[0]}")
+            if tensor.numel() == 0:
+                raise ValueError(f"{name} is empty")
+            if tensor.ndim >= 3 and tensor.shape[2:] != ref.shape[2:]:
+                raise ValueError(f"{name} has the shape {tuple(tensor.shape)}, expected {tuple(ref.shape)} (except the length)")
+            if tensor.is_floating_point() != ref.is_floating_point():
+                raise ValueError(f"{name} has the dtype {tensor.dtype}, expected {ref.dtype}")
+            if tensor.is_floating_point() and not torch.isfinite(tensor.float()).all():
+                raise ValueError(f"{name} has non-finite values")
+
+
+# endregion
+
+
 def sample_images_common(
     pipe_class,
     accelerator: Accelerator,
@@ -263,23 +530,12 @@ def sample_images_common(
     TODO Use strategies here
     """
 
-    if steps == 0:
-        if not args.sample_at_first:
-            return
-    else:
-        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
-            return
-        if args.sample_every_n_epochs is not None:
-            # sample_every_n_steps は無視する
-            if epoch is None or epoch % args.sample_every_n_epochs != 0:
-                return
-        else:
-            if steps % args.sample_every_n_steps != 0 or epoch is not None:  # steps is not divisible or end of epoch
-                return
+    if not should_sample_images(args, epoch, steps):
+        return
 
     logger.info("")
     logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
-    if not os.path.isfile(args.sample_prompts):
+    if not has_sample_prompts(args):
         logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
         return
 
@@ -296,17 +552,7 @@ def sample_images_common(
         text_encoder = accelerator.unwrap_model(text_encoder)
 
     # read prompts
-    if args.sample_prompts.endswith(".txt"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
-    elif args.sample_prompts.endswith(".toml"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            data = toml.load(f)
-        prompts = [dict(**data["prompt"], **subset) for subset in data["prompt"]["subset"]]
-    elif args.sample_prompts.endswith(".json"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            prompts = json.load(f)
+    prompts = get_sample_prompts(args)
 
     default_scheduler = get_my_scheduler(sample_sampler=args.sample_sampler, v_parameterization=args.v_parameterization)
 
@@ -324,18 +570,6 @@ def sample_images_common(
     pipeline.to(distributed_state.device)
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
-
-    # preprocess prompts
-    for i in range(len(prompts)):
-        prompt_dict = prompts[i]
-        if isinstance(prompt_dict, str):
-            prompt_dict = line_to_prompt_dict(prompt_dict)
-            prompts[i] = prompt_dict
-        assert isinstance(prompt_dict, dict)
-
-        # Adds an enumerator to the dict based on prompt position. Used later to name image files. Also cleanup of extra data in original prompt dict.
-        prompt_dict["enum"] = i
-        prompt_dict.pop("subset", None)
 
     # save random state to restore later
     rng_state = torch.get_rng_state()
@@ -491,7 +725,9 @@ def sample_image_inference(
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image.save(os.path.join(save_dir, img_filename))
+    img_path = os.path.join(save_dir, img_filename)
+    image.save(img_path)
+    notify_sample_saved(img_path)
 
     # send images to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:

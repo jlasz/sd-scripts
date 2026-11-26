@@ -45,23 +45,12 @@ def sample_images(
     prompt_replacement=None,
     controlnet=None,
 ):
-    if steps == 0:
-        if not args.sample_at_first:
-            return
-    else:
-        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
-            return
-        if args.sample_every_n_epochs is not None:
-            # sample_every_n_steps は無視する
-            if epoch is None or epoch % args.sample_every_n_epochs != 0:
-                return
-        else:
-            if steps % args.sample_every_n_steps != 0 or epoch is not None:  # steps is not divisible or end of epoch
-                return
+    if not sampling.should_sample_images(args, epoch, steps):
+        return
 
     logger.info("")
     logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
-    if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
+    if not sampling.has_sample_prompts(args) and sample_prompts_te_outputs is None:
         logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
         return
 
@@ -75,7 +64,7 @@ def sample_images(
         controlnet = accelerator.unwrap_model(controlnet)
     # print([(te.parameters().__next__().device if te is not None else None) for te in text_encoders])
 
-    prompts = sampling.load_prompts(args.sample_prompts)
+    prompts = sampling.get_sample_prompts(args)
 
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
@@ -293,7 +282,9 @@ def sample_image_inference(
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image.save(os.path.join(save_dir, img_filename))
+    img_path = os.path.join(save_dir, img_filename)
+    image.save(img_path)
+    sampling.notify_sample_saved(img_path)
 
     # send images to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:
@@ -433,17 +424,27 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    logit_offset: Optional[torch.Tensor] = None,
 ):
     """Compute the density for sampling the timesteps when doing SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
 
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+
+    ``logit_offset`` ([batch_size], CPU) is added to the normal sample of the ``logit_normal`` scheme before the
+    sigmoid (per-sample shift of ``logit_mean``). It is ignored by the other schemes.
     """
     if weighting_scheme == "logit_normal":
         # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
         u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
+        if logit_offset is not None:
+            u = u + logit_offset.to(device=u.device, dtype=u.dtype)
         u = torch.nn.functional.sigmoid(u)
     elif weighting_scheme == "mode":
         u = torch.rand(size=(batch_size,), device="cpu")
@@ -470,8 +471,56 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
     return weighting
 
 
+def sample_truncated_logit_normal_indices(
+    batch_size: int,
+    num_timesteps: int,
+    logit_mean: float,
+    logit_std: float,
+    cutoff: float,
+    uniform_ratio: float,
+    logit_offset: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Sample indices on the descending timestep grid (index 0 = sigma 1.0) from a truncated logit-normal distribution.
+
+    This is the schedule of the MOSS-Image pre-training (technical report, eq. 4):
+    ``S = sigmoid(-Z)`` with ``Z ~ N(logit_mean, logit_std)`` (the same parametrization as ``--timestep_sampling sigma``
+    with ``--weighting_scheme logit_normal``: a negative mean biases toward higher noise), truncated to ``S <= cutoff``
+    by inverse-CDF sampling, rescaled by ``1 / cutoff`` to cover ``(0, 1]`` and snapped to the grid point whose cell
+    holds it (``sigma = ceil(S * T) / T``). With probability ``uniform_ratio`` the grid point is drawn uniformly instead.
+
+    ``logit_offset`` ([batch_size]) is added to ``Z`` (per-sample shift of ``logit_mean``). Returns a CPU LongTensor.
+    """
+    if not (0.0 < cutoff <= 1.0):
+        raise ValueError(f"--timestep_cutoff must be in (0, 1], got {cutoff}")
+    if not (0.0 <= uniform_ratio <= 1.0):
+        raise ValueError(f"--timestep_uniform_ratio must be in [0, 1], got {uniform_ratio}")
+
+    mean = torch.full((batch_size,), float(logit_mean), dtype=torch.float64)
+    if logit_offset is not None:
+        mean = mean + logit_offset.detach().to(device="cpu", dtype=torch.float64)
+    std = float(logit_std)
+
+    # S <= cutoff  <=>  Z >= -logit(cutoff). Draw the CDF value uniformly in [P(Z < z_lo), 1) and invert.
+    if cutoff < 1.0:
+        z_lo = -math.log(cutoff / (1.0 - cutoff))
+        p_lo = torch.special.ndtr((z_lo - mean) / std)
+    else:
+        p_lo = torch.zeros_like(mean)
+    p = p_lo + torch.rand(batch_size, dtype=torch.float64) * (1.0 - p_lo)
+    z = mean + std * torch.special.ndtri(p.clamp(max=1.0 - 1e-12))
+
+    s = torch.sigmoid(-z) / cutoff  # (0, 1]
+    indices = (num_timesteps - torch.ceil(s * num_timesteps).long()).clamp(0, num_timesteps - 1)
+
+    if uniform_ratio > 0.0:
+        use_uniform = torch.rand(batch_size) < uniform_ratio
+        indices = torch.where(use_uniform, torch.randint(0, num_timesteps, (batch_size,)), indices)
+    return indices
+
+
 def get_noisy_model_input_and_timesteps(
-    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
+    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype,
+    timestep_sampling_offset: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, h, w = latents.shape[0], latents.shape[-2], latents.shape[-1]
     assert bsz > 0, "Batch size not large enough"
@@ -480,7 +529,10 @@ def get_noisy_model_input_and_timesteps(
         # Simple random sigma-based noise sampling
         if args.timestep_sampling == "sigmoid":
             # https://github.com/XLabs-AI/x-flux/tree/main
-            sigmas = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
+            r = torch.randn((bsz,), device=device)
+            if timestep_sampling_offset is not None:
+                r = r + timestep_sampling_offset.to(device=device, dtype=r.dtype)
+            sigmas = torch.sigmoid(args.sigmoid_scale * r)
         else:
             sigmas = torch.rand((bsz,), device=device)
 
@@ -488,26 +540,47 @@ def get_noisy_model_input_and_timesteps(
     elif args.timestep_sampling == "shift":
         shift = args.discrete_flow_shift
         sigmas = torch.randn(bsz, device=device)
+        if timestep_sampling_offset is not None:
+            sigmas = sigmas + timestep_sampling_offset.to(device=device, dtype=sigmas.dtype)
         sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
         sigmas = sigmas.sigmoid()
         sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "flux_shift":
         sigmas = torch.randn(bsz, device=device)
+        if timestep_sampling_offset is not None:
+            sigmas = sigmas + timestep_sampling_offset.to(device=device, dtype=sigmas.dtype)
         sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
         sigmas = sigmas.sigmoid()
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
         sigmas = time_shift(mu, 1.0, sigmas)
         timesteps = sigmas * num_timesteps
+    elif args.timestep_sampling == "truncated_logit_normal":
+        # Truncated logit-normal on the (shift-aware) training grid, see sample_truncated_logit_normal_indices.
+        # The normal sample is the logit of 1 - sigma (the grid is descending), so timestep_sampling_offset is
+        # subtracted to keep the convention of the other modes: a positive offset moves toward higher noise.
+        logit_offset = None if timestep_sampling_offset is None else -timestep_sampling_offset
+        indices = sample_truncated_logit_normal_indices(
+            bsz, num_timesteps, args.logit_mean, args.logit_std, args.timestep_cutoff, args.timestep_uniform_ratio, logit_offset
+        )
+        timesteps = noise_scheduler.timesteps[indices].to(device=device)
+        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
+        # timestep_sampling_offset: only the logit_normal scheme draws a normal sample (the logit of u = 1 - sigma,
+        # the grid is descending), so the offset is subtracted from it to keep the convention of the other modes
+        # (a positive offset moves toward higher noise). The other weighting schemes ignore the offset.
+        logit_offset = None
+        if timestep_sampling_offset is not None and args.weighting_scheme == "logit_normal":
+            logit_offset = -timestep_sampling_offset.detach().to(device="cpu", dtype=torch.float32)
         u = compute_density_for_timestep_sampling(
             weighting_scheme=args.weighting_scheme,
             batch_size=bsz,
             logit_mean=args.logit_mean,
             logit_std=args.logit_std,
             mode_scale=args.mode_scale,
+            logit_offset=logit_offset,
         )
         indices = (u * num_timesteps).long()
         timesteps = noise_scheduler.timesteps[indices].to(device=device)
@@ -532,10 +605,39 @@ def get_noisy_model_input_and_timesteps(
 
 
 # timestep_sampling values whose distribution actually depends on --discrete_flow_shift.
-# "shift" uses it explicitly; "sigma" uses it via the shifted scheduler.timesteps. The others
-# ("uniform", "sigmoid", "flux_shift") ignore discrete_flow_shift entirely. This is shared by both
+# "shift" uses it explicitly; "sigma" and "truncated_logit_normal" use it via the shifted scheduler.timesteps.
+# The others ("uniform", "sigmoid", "flux_shift") ignore discrete_flow_shift entirely. This is shared by both
 # FLUX and Anima since Anima reuses get_noisy_model_input_and_timesteps below.
-_SHIFT_AWARE_TIMESTEP_SAMPLING = ("sigma", "shift")
+_SHIFT_AWARE_TIMESTEP_SAMPLING = ("sigma", "shift", "truncated_logit_normal")
+
+# timestep_sampling values that always support timestep_sampling_offset (per-subset custom attribute,
+# see docs/timestep_sampling_offset.md). Applied to the pre-sigmoid normal sample. "sigma" supports it only
+# with the logit_normal weighting scheme, see timestep_sampling_uses_offset.
+_OFFSET_AWARE_TIMESTEP_SAMPLING = ("sigmoid", "shift", "flux_shift", "truncated_logit_normal")
+
+
+def timestep_sampling_uses_offset(args) -> bool:
+    """Whether timestep_sampling_offset affects the distribution for the chosen ``--timestep_sampling``."""
+    if args.timestep_sampling in _OFFSET_AWARE_TIMESTEP_SAMPLING:
+        return True
+    return args.timestep_sampling == "sigma" and args.weighting_scheme == "logit_normal"
+
+
+def get_show_timesteps_offset(args) -> Tuple[Optional[float], str]:
+    """Resolve ``--show_timesteps_offset`` into ``(offset or None, header note)``. Shared by FLUX and Anima.
+
+    Returns ``None`` when the offset is 0.0 or the chosen ``--timestep_sampling`` ignores it,
+    mirroring the training-time behavior of per-subset ``timestep_sampling.offset``.
+    """
+    offset = getattr(args, "show_timesteps_offset", 0.0) or 0.0
+    if offset == 0.0:
+        return None, ""
+    if timestep_sampling_uses_offset(args):
+        return offset, f", timestep_sampling_offset={offset}"
+    return None, (
+        f", timestep_sampling_offset={offset} (IGNORED for timestep_sampling='{args.timestep_sampling}'; "
+        "only 'sigmoid', 'shift', 'flux_shift', 'truncated_logit_normal' and 'sigma' with weighting_scheme='logit_normal' use it)"
+    )
 
 
 def get_timestep_sampling_info(args) -> str:
@@ -551,12 +653,19 @@ def get_timestep_sampling_info(args) -> str:
     else:
         parts.append(
             f"discrete_flow_shift={args.discrete_flow_shift} (IGNORED for timestep_sampling='{sampling}'; "
-            "only 'sigma' and 'shift' use it)"
+            "only 'sigma', 'shift' and 'truncated_logit_normal' use it)"
         )
     if sampling in ("sigmoid", "shift", "flux_shift"):
         parts.append(f"sigmoid_scale={args.sigmoid_scale}")
     if sampling == "sigma":
         parts.append(f"weighting_scheme={args.weighting_scheme}")
+        if args.weighting_scheme == "logit_normal":
+            parts.append(f"logit_mean={args.logit_mean}, logit_std={args.logit_std}")
+    if sampling == "truncated_logit_normal":
+        parts.append(
+            f"logit_mean={args.logit_mean}, logit_std={args.logit_std}, timestep_cutoff={args.timestep_cutoff}, "
+            f"timestep_uniform_ratio={args.timestep_uniform_ratio}"
+        )
     return ", ".join(parts)
 
 
@@ -597,11 +706,15 @@ def show_timesteps(args):
     # latent size for the assumed image resolution (flux_shift reads h, w for the packed-size shift)
     h, w = parse_show_timesteps_latent_size(args)
     device, dtype = device_utils.get_preferred_device(), torch.float32
+    offset, offset_note = get_show_timesteps_offset(args)
 
     def sample_timesteps(bsz):
         latents = torch.zeros(bsz, 16, h, w, dtype=dtype, device=device)
         noise = torch.ones_like(latents)
-        _, timesteps, _ = get_noisy_model_input_and_timesteps(args, noise_scheduler, latents, noise, device, dtype)
+        tso = None if offset is None else torch.full((bsz,), offset, dtype=dtype, device=device)
+        _, timesteps, _ = get_noisy_model_input_and_timesteps(
+            args, noise_scheduler, latents, noise, device, dtype, timestep_sampling_offset=tso
+        )
         return timesteps
 
     def compute_weighting(timesteps):
@@ -612,6 +725,7 @@ def show_timesteps(args):
     header = (
         "Timestep distribution / タイムステップ分布:\n  "
         + get_timestep_sampling_info(args)
+        + offset_note
         + f", resolution={args.show_timesteps_resolution} (latent {h}x{w}), model_prediction_type={args.model_prediction_type}"
     )
     timestep_visualization.show_timestep_distribution(
@@ -744,10 +858,12 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "truncated_logit_normal"],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and FLUX.1 shifting."
-        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、FLUX.1のシフト。",
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, FLUX.1 shifting"
+        " and truncated logit-normal on the training grid (--logit_mean / --logit_std / --timestep_cutoff / --timestep_uniform_ratio)."
+        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、FLUX.1のシフト、"
+        "学習グリッド上の切り詰めた logit-normal（--logit_mean / --logit_std / --timestep_cutoff / --timestep_uniform_ratio）。",
     )
     parser.add_argument(
         "--sigmoid_scale",

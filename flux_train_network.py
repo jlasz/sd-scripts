@@ -8,6 +8,7 @@ import torch
 from accelerate import Accelerator
 
 from library.device_utils import clean_memory_on_device, init_ipex
+from library.custom_offloading_utils import BlockSwapConfig
 
 init_ipex()
 
@@ -134,8 +135,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
-            logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
-            model.enable_block_swap(args.blocks_to_swap, accelerator.device)
+            # The base weights are frozen in LoRA training. Freeze them here, before enabling block swap, for the H2D-only offloader.
+            model.requires_grad_(False)
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            logger.info(
+                f"enable block swap: blocks_to_swap={args.blocks_to_swap}, H2D-only: {swap_config.h2d_only}, "
+                f"use pinned memory: {swap_config.use_pinned_memory}"
+            )
+            model.enable_block_swap(args.blocks_to_swap, swap_config)
 
         if self.use_clip_l:
             clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
@@ -332,9 +339,18 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
+        # Per-sample timestep sampling offset from custom_attributes: timestep_sampling = { offset = ... }
+        tso = None
+        if is_train and "custom_attributes" in batch:
+            offsets = [ca.get("timestep_sampling", {}).get("offset", 0.0) for ca in batch["custom_attributes"]]
+            t = torch.tensor(offsets, dtype=torch.float32)
+            if t.abs().sum() > 0:
+                tso = t
+
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
+            timestep_sampling_offset=tso,
         )
 
         # pack latents and get img_ids

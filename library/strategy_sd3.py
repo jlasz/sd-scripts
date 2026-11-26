@@ -4,7 +4,8 @@ import random
 from typing import Any, List, Optional, Tuple, Union
 import torch
 import numpy as np
-from transformers import CLIPTokenizer, T5TokenizerFast, CLIPTextModel, CLIPTextModelWithProjection, T5EncoderModel
+from transformers import T5TokenizerFast, CLIPTextModel, CLIPTextModelWithProjection, T5EncoderModel
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
 
 from library import sd3_utils
 import library.accelerator_setup as accelerator_setup
@@ -324,10 +325,14 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return [lg_out, t5_out, lg_pooled, l_attn_mask, g_attn_mask, t5_attn_mask]
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        infos: List,
+        captions: List[str],
     ):
         sd3_text_encoding_strategy: Sd3TextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
 
         tokens_and_masks = tokenize_strategy.tokenize(captions)
         with torch.no_grad():

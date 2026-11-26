@@ -16,6 +16,8 @@ from PIL import Image
 
 from library.device_utils import init_ipex, clean_memory_on_device, synchronize_device
 from library import anima_models, anima_utils, checkpoint_io, sampling, qwen_image_autoencoder_kl
+import library.args as args_util
+import library.compile_utils as compile_utils
 import library.model_io as model_io
 
 init_ipex()
@@ -103,7 +105,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "--timestep_sampling",
         type=str,
         default="sigmoid",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "truncated_logit_normal"],
         help="Timestep sampling method (default: sigmoid (logit normal))",
     )
     parser.add_argument(
@@ -143,59 +145,10 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Use the image-only 2D Qwen-Image VAE implementation. Official Qwen-Image VAE weights are converted on load."
         + " / 画像専用の2D Qwen-Image VAE実装を使用します。公式Qwen-Image VAEの重みはロード時に変換されます。",
     )
+    args_util.add_gradient_checkpointing_skip_blocks_argument(parser)
 
-    # torch.compile (per-block compilation, Triton required). Independent of the legacy
-    # accelerate-based --torch_compile; the two cannot be used together.
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="Enable per-block torch.compile for the DiT (requires Triton). Cannot be used with --torch_compile."
-        + " / DiTのブロック単位でtorch.compileを有効にする（Tritonが必要）。--torch_compileとは併用できません。",
-    )
-    parser.add_argument(
-        "--compile_backend",
-        type=str,
-        default="inductor",
-        help="torch.compile backend (default: inductor) / torch.compileのバックエンド（デフォルト: inductor）",
-    )
-    parser.add_argument(
-        "--compile_mode",
-        type=str,
-        default="default",
-        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-        help="torch.compile mode (default: default, recommended for training) / torch.compileのモード（デフォルト: default、学習に推奨）",
-    )
-    parser.add_argument(
-        "--compile_dynamic",
-        type=str,
-        default=None,
-        choices=["true", "false", "auto"],
-        help="Dynamic shapes mode for torch.compile (default: None, same as auto). On Windows, 'true' requires the Visual Studio 2022 C++ compiler."
-        + " / torch.compileの動的形状モード（デフォルト: None、autoと同じ）。Windowsで'true'を使うにはVisual Studio 2022のC++コンパイラが必要です。",
-    )
-    parser.add_argument(
-        "--compile_fullgraph",
-        action="store_true",
-        help="Enable fullgraph mode in torch.compile. Cannot be used with --split_attn."
-        + " / torch.compileでフルグラフモードを有効にする。--split_attnとは併用できません。",
-    )
-    parser.add_argument(
-        "--compile_cache_size_limit",
-        type=int,
-        default=None,
-        help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32, recommended: 32)"
-        + " / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32、推奨: 32）",
-    )
-    parser.add_argument(
-        "--cuda_allow_tf32",
-        action="store_true",
-        help="Allow TF32 precision on Ampere or newer GPUs (improves performance) / Ampere以降のGPUでTF32を許可する（パフォーマンス向上）",
-    )
-    parser.add_argument(
-        "--cuda_cudnn_benchmark",
-        action="store_true",
-        help="Enable cuDNN benchmark mode (may improve performance) / cuDNNのベンチマークモードを有効にする（パフォーマンスが向上する可能性がある）",
-    )
+    # torch.compile (per-block compilation, Triton required) and CUDA performance switches
+    compile_utils.add_compile_arguments(parser)
 
 
 def load_qwen_image_vae(args, device="cpu", disable_mmap: bool = True):
@@ -255,11 +208,15 @@ def show_timesteps(args):
     )
     h, w = flux_train_utils.parse_show_timesteps_latent_size(args)  # latent size for the assumed image resolution
     device, dtype = device_utils.get_preferred_device(), torch.float32
+    offset, offset_note = flux_train_utils.get_show_timesteps_offset(args)
 
     def sample_timesteps(bsz):
         latents = torch.zeros(bsz, 16, h, w, dtype=dtype, device=device)
         noise = torch.ones_like(latents)
-        _, timesteps, _ = flux_train_utils.get_noisy_model_input_and_timesteps(args, noise_scheduler, latents, noise, device, dtype)
+        tso = None if offset is None else torch.full((bsz,), offset, dtype=dtype, device=device)
+        _, timesteps, _ = flux_train_utils.get_noisy_model_input_and_timesteps(
+            args, noise_scheduler, latents, noise, device, dtype, timestep_sampling_offset=tso
+        )
         return timesteps
 
     def compute_weighting(timesteps):
@@ -269,6 +226,7 @@ def show_timesteps(args):
     header = (
         "Timestep distribution / タイムステップ分布:\n  "
         + flux_train_utils.get_timestep_sampling_info(args)
+        + offset_note
         + f", resolution={args.show_timesteps_resolution} (latent {h}x{w})"
     )
     timestep_visualization.show_timestep_distribution(
@@ -524,21 +482,11 @@ def sample_images(
         for injecting per-prompt state into wrapper modules (e.g. ControlNet-LLLite cond image).
         Signature: ``on_prompt_start(prompt_dict, accelerator)`` / ``on_prompt_end(prompt_dict)``.
     """
-    if steps == 0:
-        if not args.sample_at_first:
-            return
-    else:
-        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
-            return
-        if args.sample_every_n_epochs is not None:
-            if epoch is None or epoch % args.sample_every_n_epochs != 0:
-                return
-        else:
-            if steps % args.sample_every_n_steps != 0 or epoch is not None:
-                return
+    if not sampling.should_sample_images(args, epoch, steps):
+        return
 
     logger.info(f"Generating sample images at step {steps}")
-    if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
+    if not sampling.has_sample_prompts(args) and sample_prompts_te_outputs is None:
         logger.error(f"No prompt file: {args.sample_prompts}")
         return
 
@@ -551,7 +499,7 @@ def sample_images(
 
     distributed_state = PartialState()  # for multi gpu distributed inference. this is a singleton, so it's safe to use it here
 
-    prompts = sampling.load_prompts(args.sample_prompts)
+    prompts = sampling.get_sample_prompts(args)
     save_dir = os.path.join(args.output_dir, "sample")
     os.makedirs(save_dir, exist_ok=True)
 
@@ -753,7 +701,9 @@ def _sample_image_inference(
     seed_suffix = "" if seed is None else f"_{seed}"
     i = prompt_dict.get("enum", 0)
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image.save(os.path.join(save_dir, img_filename))
+    img_path = os.path.join(save_dir, img_filename)
+    image.save(img_path)
+    sampling.notify_sample_saved(img_path)
 
     # Log to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:

@@ -28,6 +28,7 @@ import safetensors.torch
 
 import library.sai_model_spec as sai_model_spec
 from library.device_utils import clean_memory_on_device
+from library.clip_text_model import wrap_clip_text_model
 from library.utils import setup_logging
 
 if TYPE_CHECKING:
@@ -337,6 +338,7 @@ def get_sai_model_spec_dataclass(
     lumina: str = None,
     hunyuan_image: str = None,
     anima: str = None,
+    moss_image: str = None,
     optional_metadata: dict[str, str] | None = None,
 ) -> sai_model_spec.ModelSpecMetadata:
     """
@@ -370,6 +372,8 @@ def get_sai_model_spec_dataclass(
         model_config["hunyuan_image"] = hunyuan_image
     if anima is not None:
         model_config["anima"] = anima
+    if moss_image is not None:
+        model_config["moss_image"] = moss_image
     # Use the dataclass function directly
     return sai_model_spec.build_metadata_dataclass(
         state_dict,
@@ -417,7 +421,7 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu", une
                 f"model is not found as a file or in Hugging Face, perhaps file name is wrong? / 指定したモデル名のファイル、またはHugging Faceのモデルが見つかりません。ファイル名が誤っているかもしれません: {name_or_path}"
             )
             raise ex
-        text_encoder = pipe.text_encoder
+        text_encoder = wrap_clip_text_model(pipe.text_encoder)
         vae = pipe.vae
         unet = pipe.unet
         del pipe

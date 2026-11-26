@@ -50,36 +50,94 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 
 ### 更新履歴
 
-- **Version 0.11.1 (2026-06-16):**
-    - Anima LoRA／LLLite学習でtorch.compileサポートを追加しました。[PR #2379](https://github.com/kohya-ss/sd-scripts/pull/2379)
-        - 学習が20%ほど高速化されるようです。動作にはTritonやMSVCコンパイラが必要です。詳細は[ドキュメント](./docs/anima_torch_compile.md)をご覧ください。
-    - 2DのみのQwen-Image VAEを追加しました。[PR #2382](https://github.com/kohya-ss/sd-scripts/pull/2382)
-        - [issue #2369](https://github.com/kohya-ss/sd-scripts/issues/2369) での woct0rdho 氏の提案に基づいています。woct0rdho 氏に感謝します。
-        - `--qwen_image_vae_2d` を指定すると有効になります。重みは通常版（3D版）と同じものが使用できます。
-        - latentの事前キャッシュの高速化が期待できます（学習自体は変わりません）。詳細は[ドキュメント](./docs/anima_train_network.md#memory-and-speed--メモリ速度関連)をご覧ください。
-    - LLLiteインペインティングモデルの学習サポートを追加しました。[PR #2378](https://github.com/kohya-ss/sd-scripts/pull/2378)
-        - 詳細は[ドキュメント](./docs/anima_train_control_net_lllite.md)をご覧ください。
-    - timestep samplingの設定値のログ出力、timestepsの分布の可視化を追加しました。[PR #2384](https://github.com/kohya-ss/sd-scripts/pull/2384)
-        - 可視化により学習がどのようなタイムステップで行われるかを理解しやすくなります。
-        - 詳細は[ドキュメント](./docs/anima_train_network.md#visualizing-the-timestep-distribution)をご覧ください。
+- **Version 0.13.1 (2026-11-23):**
+    - 同じ学習の複数の LoRA チェックポイントを指数移動平均で 1 つの LoRA にまとめる `networks/lora_post_hoc_ema.py`（Post-Hoc EMA）を追加しました（Musubi Tuner からの移植）。学習終盤に保存したチェックポイントを平均することで重みの揺れが減り、最後のチェックポイントより安定した結果になることがあります。詳細は[ドキュメント](./docs/lora_post_hoc_ema.md)をご覧ください。[PR #2510](https://github.com/kohya-ss/sd-scripts/pull/2510)
+    - 1 プロセスでのマルチ GPU 学習（`--replica_devices`）の不具合を修正しました。1 エポックのバッチ数が GPU 数の倍数でない場合に、一部のエポック（2 GPU では 1 エポックおき）で GPU が同時に動作せず、そのエポックの学習が最大で約 2 倍遅くなっていました。影響は速度のみで、学習結果には影響しません。[PR #2508](https://github.com/kohya-ss/sd-scripts/pull/2508)
 
-- **Version 0.11.0 (2026-06-12):**
-    - コードベースの大規模な内部リファクタリングを行い、コードベースの品質と保守性を向上させました。[PR #2372](https://github.com/kohya-ss/sd-scripts/pull/2372)
-        - ユーザーの方には直接の影響が極力少なくなるよう配慮しました。詳細について、および不具合報告などは[こちらのdiscussion](https://github.com/kohya-ss/sd-scripts/discussions/2358)までお願いします。
+- **Version 0.13.0 (2026-11-21):**
+    - LoRA 学習スクリプトに `--run_control`（実験的機能）を追加しました。実行中の学習を、スクリプトや AI エージェントから観測・操作できます。詳細は[ドキュメント](./docs/run_control.md)をご覧ください。[PR #2494](https://github.com/kohya-ss/sd-scripts/pull/2494) [PR #2495](https://github.com/kohya-ss/sd-scripts/pull/2495) [PR #2496](https://github.com/kohya-ss/sd-scripts/pull/2496) [PR #2497](https://github.com/kohya-ss/sd-scripts/pull/2497) [PR #2498](https://github.com/kohya-ss/sd-scripts/pull/2498) [PR #2499](https://github.com/kohya-ss/sd-scripts/pull/2499) [PR #2500](https://github.com/kohya-ss/sd-scripts/pull/2500) [PR #2501](https://github.com/kohya-ss/sd-scripts/pull/2501)
+        - 実行中の学習の状態を、`<output_dir>/<output_name>_run` に通常の JSON ファイルとして書き出します。TensorBoard のイベントファイルを解析しなくても、スクリプトや AI エージェントから学習を観測できます。
+            - `manifest.json`: 解決済みの引数、データセットの集計、実行環境。
+            - `status.json`: 現在のステップ、loss、学習率、速度、ETA、VRAM、最後の出力。
+            - `events.jsonl`: チェックポイント、state、サンプル画像、異常、終了時の状態とエラー。
+            - `loss.jsonl`: 学習した各サンプルの loss と、その画像、timestep、解像度。
+        - `tools/analyze_run_loss.py` はサンプル単位の loss を timestep 別、解像度別、画像別に集計するもので、うまく学習できていない画像（画像とキャプションの不一致など）を探すのに役立ちます。
+        - 実行中の学習はコマンドも受け付け、定期実行のタイミングを待たずに操作できます。コマンドは `tools/run_control_cli.py`（または JSON ファイルを書く任意のプログラム）から送ります。
+            - `sample`: 現在の重みでサンプル画像を生成します（プロンプトファイルのプロンプト、Text Encoder がメモリにあれば新しいプロンプトも可）。
+            - `save` / `save_state`: モデルや state を保存します。
+            - `stop`: それらを保存してから学習を停止します。
+            - `pause` / `resume`: VRAM をしばらく空けるために学習を一時停止します（ベースモデルを CPU に移して戻すもので、プロセスは残ります）。レプリカ学習（`--replica_devices`）では、`pause` は学習を止めるだけで、モデルは各デバイスに残り VRAM は解放されません。
+        - プロンプトファイルで `--s 0`（ステップ数 0）を指定したプロンプトは *予備プロンプト* になります。定期的なサンプル生成では飛ばされますが、Text Encoder の出力は開始時にキャッシュされるため、Text Encoder をメモリに残さない構成でも随時生成できます（`sample --index`）。
+        - Anima と MOSS-Image では、`tools/run_control_sample_prompt.py` により、Text Encoder をメモリに残さない構成でも新しいプロンプトのサンプル画像を生成できます。スクリプト自身のプロセスで Text Encoder を動かしてプロンプトをエンコードし（デフォルトは CPU。ここでのエラーは学習に影響しません）、その出力を学習側に送ります。
+        - 学習の起動と見守りを AI コーディングエージェントに任せる場合のために、手順と注意点をまとめた[エージェント向けガイド](./docs/agent_guide.md)（英語）も用意しました。エージェントに読ませてください。
+    - MOSS-Image と Anima の学習に `--gradient_checkpointing_skip_blocks`（部分的な gradient checkpointing）を追加しました。末尾の N 個の transformer ブロックは backward で再計算せず activation を保持するため、余っている VRAM を速度に変換できます。VRAM 使用量とステップ時間は N に対して線形に変化します（デフォルトの `0` は従来どおりの動作）。最近の大きなモデルでは batch size を増やしてもスループットはほとんど向上しないため、24GB〜48GB の GPU で余った VRAM の使い道としてはこちらの方が有利なことが多いです。MOSS-Image の LoRA 学習（約 1MP、batch size 1、bf16）の実測では、`0` で 13.5GB / 1.29 s/step、`42`（全ブロック）で 55GB / 0.93 s/step、1 ブロックあたり約 1GB と 8.6 ms でした。`--compile`（ConvRot INT8）では 1 ブロックあたりの VRAM が約 0.6GB に下がります。Anima では `0` で 6.5GB / 0.85 s/step、`28` で 19.9GB / 0.53 s/step でした。表は [MOSS-Image](./docs/moss_image_train_network.md#71-vram-usage-optimization--vram-使用量の最適化) と [Anima](./docs/anima_train_network.md#71-vram-usage-optimization--vram使用量の最適化) のドキュメントをご覧ください。[PR #2485](https://github.com/kohya-ss/sd-scripts/pull/2485)
+    - Anima と MOSS-Image の LoRA 学習に、1 プロセスでのマルチ GPU 学習（`--replica_devices`、実験的機能）を追加しました。DDP を使わず、1 つの Python プロセスがマスターと追加 GPU ごとのレプリカを駆動します。`accelerate launch --multi_gpu`、`torchrun`、NCCL / gloo が不要なため、Windows でもマルチ GPU の LoRA 学習ができます。`--cache_latents`、`--cache_text_encoder_outputs`、`--network_train_unet_only` が必須で、`train_batch_size` は DDP と同様にデバイスごとの値です。詳細は[ドキュメント](./docs/replica_training.md)をご覧ください。
+        - 開発者向け: `train_network.py` の `NetworkTrainer.create_network`（引数からのネットワーク生成）と `NetworkTrainer.forward_backward`（1 micro-step）がオーバーライド可能なメソッドとして追加されました。レプリカ学習（`library/replica_trainer.py`）はモデルごとの trainer クラスの前に合成される mixin です。
+        - 修正: 複数 GPU のあるマシンで、`accelerate launch` を使わずに `python` で直接起動した単一プロセスの学習が accelerator の初期化で失敗していました（`Default process group has not been initialized`）。
+    - MOSS-Image に `--text_encoder_blocks_to_swap` を追加しました。テキストエンコーダーの 32 層のうち指定した数の層を GPU に常駐させず CPU からストリーミングするため、VRAM 8GB の GPU でもテキストエンコーダー出力をキャッシュできます（ピークは bf16 で `28` なら約 5GB、`32` なら約 3.5GB、ConvRot INT8 で `32` なら約 2.2GB）。学習スクリプトと `tools/cache_text_encoder_outputs.py` で使用できます。[PR #2478](https://github.com/kohya-ss/sd-scripts/pull/2478) dskjal 氏に感謝します。[PR #2483](https://github.com/kohya-ss/sd-scripts/pull/2483)
+        - 層のストリーミングには `--block_swap_h2d_only` と同じ H2D-only オフローダーを使います（このオプションの指定は不要です。重みは CPU に置いたまま、現在の層の実行中に次の層を先読みします）。このオフローダーは、Qwen3.5-9B の linear / full attention 層のように形の異なるブロックにも対応しました。
+    - `networks/resize_lora.py` に `--svd_method qr` を追加しました。`lora_up @ lora_down` をマージせずに QR 分解で LoRA の重みの厳密な SVD を計算するため、大幅に高速で（SDXL の LoRA で 100 倍以上）、`svd_lowrank` のようなランダム性もありません。`--new_rank` が元の rank より大きい場合は `--new_rank` までパディングします。デフォルトの `merged` は従来の動作です。[PR #2482](https://github.com/kohya-ss/sd-scripts/pull/2482) woct0rdho 氏に感謝します。[PR #2484](https://github.com/kohya-ss/sd-scripts/pull/2484)
+    - Anima で、DiT のブロック数をチェックポイントから推定するようになりました。コミュニティ製の [Anima-2.9B](https://huggingface.co/Gazingstars123/Anima-2.9B)（40 ブロック）のように、Anima-Preview とブロック数だけが異なる派生モデルを LoRA 学習と推論に使用できます。これらの派生モデルは定期的なテストの対象外である点にご注意ください。[PR #2418](https://github.com/kohya-ss/sd-scripts/pull/2418) gazingstars123 氏に感謝します。[PR #2486](https://github.com/kohya-ss/sd-scripts/pull/2486) davrens101 氏に感謝します。[PR #2502](https://github.com/kohya-ss/sd-scripts/pull/2502)
 
-- **Version 0.10.6 (2026-06-12):**
-    - リファクタリングマージ前の安定バージョン。
+- **Version 0.12.3 (2026-10-26):**
+    - FLUX.1、Anima、HunyuanImage-2.1、MOSS-Image の学習に `--timestep_sampling truncated_logit_normal` を追加しました。離散的な学習グリッド上の logit-normal 分布（`--logit_mean` / `--logit_std`）を `--timestep_cutoff`（デフォルト 0.95）で切り詰めてリスケールし、`--timestep_uniform_ratio`（デフォルト 0.01）の割合で一様サンプルを混ぜます。`--logit_mean -1.09 --logit_std 0.95 --discrete_flow_shift 1.0` と組み合わせると、MOSS-Image の事前学習のタイムステップスケジュールを正確に再現します（これまでは切り詰めと一様サンプルは再現していませんでした）。[PR #2471](https://github.com/kohya-ss/sd-scripts/pull/2471)
+        - サブセットごとの `timestep_sampling.offset` が `truncated_logit_normal` と、`--weighting_scheme logit_normal` の `sigma` にも適用されるようになりました（他のモードと同様に、正のオフセットはノイズが多い側に偏らせます）。詳細は[ドキュメント](./docs/timestep_sampling_offset.md)をご覧ください。
+    - MOSS-Image で、ConvRot INT8 の Linear 層も `--compile` の対象になりました。融合 Triton カーネルを `torch.library` のカスタム op として登録したため、コンパイルされたブロックが量子化済みの Linear 層ごとに分断されなくなり、`--convrot_int8` の学習でも `--compile` で高速化されます。[PR #2473](https://github.com/kohya-ss/sd-scripts/pull/2473)
+        - INT8 Linear 層の backward も高速化しました。GEMM の後で活性化を回転する代わりに、重みの逆量子化と逆回転を一つのカーネルで行います。[PR #2474](https://github.com/kohya-ss/sd-scripts/pull/2474)
+        - INT8 GEMM の autotune 設定に、Ampere（RTX 30xx）GPU 向けのタイル（従来の設定ではハードウェアの INT8 性能の約 40% しか出ていませんでした）と、Blackwell（RTX 50xx / RTX PRO）向けの設定を追加しました。[PR #2475](https://github.com/kohya-ss/sd-scripts/pull/2475)
 
-- **Version 0.10.5 (2026-05-08):**
-    - transformersのバージョン5以降に対応しました。[PR #2315](https://github.com/kohya-ss/sd-scripts/pull/2315) および [PR #2316](https://github.com/kohya-ss/sd-scripts/pull/2316) marcus165090-spec氏に感謝します。
-        - `requirements.txt`の`transformers`のバージョンは4.xのままですが、5.xでも動作します。何らかの理由で5.xを用いる場合はdiffusersもあわせて最新バージョンにしてください。
-    - Anima向けのControlNet-LLLite学習に対応しました。[PR #2317](https://github.com/kohya-ss/sd-scripts/pull/2317)
-        - 詳細は[ドキュメント](./docs/anima_train_control_net_lllite.md)をご覧ください。
+- **Version 0.12.2 (2026-10-20):**
+    - LoRA 学習向けに、H2D-only block swap（`--block_swap_h2d_only`）を追加しました（Musubi Tuner からの移植）。凍結されたベースモデルの重みを CPU に置いたまま Host→Device 方向にのみコピーすることで、従来の block swap にあった Device→Host の転送が不要になり、学習速度が向上します。FLUX.1 / Chroma、Lumina Image 2.0、HunyuanImage-2.1、Anima、MOSS-Image で使用できます（SD3 は対象外）。`--gradient_checkpointing` が必須です。詳細は[ドキュメント](./docs/block_swap.md)をご覧ください。[PR #2467](https://github.com/kohya-ss/sd-scripts/pull/2467)
+        - `--block_swap_ring_size`（デフォルト 2）でストリーミングするブロック用の GPU バッファ数を指定できます。`--use_pinned_memory_for_block_swap` を指定すると CPU 側のコピーを pinned メモリに置き、転送が高速になります。
+        - 開発者向け: 各モデルの `enable_block_swap` はデバイスの代わりに `BlockSwapConfig` を受け取るようになりました。また offloader の `submit_move_blocks` は Musubi Tuner と同じ `submit_move_blocks_forward` に改名されています。
+    - MOSS-Image で、複数のキャプション候補（`enable_multiline_caption` と区切り行）を持つ画像でも Text Encoder の出力をキャッシュできるようになりました。全候補をエンコードして一つのキャッシュファイルに保存し、ステップごとにランダムに一つを選びます。[PR #2466](https://github.com/kohya-ss/sd-scripts/pull/2466)
+        - 処理済みのキャプション文字列もキャッシュファイルに保存されるため、キャプション（や `caption_prefix` / `caption_suffix`）を変更すると自動的にキャッシュが作り直されます。バージョン 0.12.1 で作成したキャッシュファイルは、候補が一つの画像ではそのまま使えます。
+        - キャッシュのサイズとキャッシュ時間は候補数倍になります。他のモデルでは、複数候補を持つ画像があると引き続き Text Encoder 出力をキャッシュできません。
+        - `tools/cache_text_encoder_outputs.py` は、複数候補に対応していないモデルで複数候補があるとエラーで停止するようになりました（以前は先頭の候補だけを黙ってキャッシュしていました）。
 
-- **Version 0.10.4 (2026-05-07):**
-    - Intel GPUの互換性を向上しました。[PR #2307](https://github.com/kohya-ss/sd-scripts/pull/2307) WhitePr氏に感謝します。
-    - SD 1.5/SDXLのinpaintingモデルの学習に対応しました。[PR #2309](https://github.com/kohya-ss/sd-scripts/pull/2309) および [PR #2318](https://github.com/kohya-ss/sd-scripts/pull/2318)allanoepping氏に感謝します。
-        - 詳細は[ドキュメント](./docs/inpainting_training.md)をご覧ください。
+- **Version 0.12.1 (2026-10-18):**
+    - [MOSS-Image](https://github.com/OpenMOSS/MOSS-Image)（OpenMOSS。Qwen3.5-9B テキストエンコーダーと FLUX.2 VAE を使う 5B の DiT）の LoRA 学習に対応しました。[PR #2458](https://github.com/kohya-ss/sd-scripts/pull/2458)、[PR #2459](https://github.com/kohya-ss/sd-scripts/pull/2459)、[PR #2460](https://github.com/kohya-ss/sd-scripts/pull/2460)、[PR #2461](https://github.com/kohya-ss/sd-scripts/pull/2461)
+        - `moss_image_train_network.py` で DiT の LoRA（LoHa / LoKr も可）と、オプションでテキストエンコーダーの LoRA を学習できます。公式の diffusers 形式の分割ファイルと、ComfyUI 向けの単一ファイルのチェックポイントを読み込めます。詳細は[ドキュメント](./docs/moss_image_train_network.md)をご覧ください。
+        - fp8 の代わりに、ベース重みの ConvRot INT8 量子化（DiT は `--convrot_int8`、テキストエンコーダーは `--convrot_int8_text_encoder`。Musubi Tuner からの移植）が使えます。ComfyUI の事前量子化済み `*_int8_convrot.safetensors` は自動判別されます。融合 int8 カーネルには `triton`（Windows では `triton-windows`）が必要です。
+        - DiT の LoRA は変換なしで ComfyUI で使用できます。LoRA を適用した推論用に `moss_image_minimal_inference.py` も用意しています。
+        - `tools/cache_latents.py` と `tools/cache_text_encoder_outputs.py` は `--moss_image` で MOSS-Image に対応しています。
+        - LoRA モジュールは新規の汎用モジュール `networks.lora_generic` です（正規表現によるモジュール選択、`network_reg_dims` / `network_reg_lrs` など `networks.lora_anima` と同じ）。今後、他のアーキテクチャの基盤にする予定です。
+    - 改行を含むキャプションをそのまま使うためのサブセットオプション `enable_multiline_caption`（`--enable_multiline_caption`）を追加しました。Anima、Lumina、HunyuanImage など LLM ベースの Text Encoder を持つモデル向けです。
+        - `multiline_caption_separator`（デフォルト `---===---`）で始まる行で、一つの画像に対する複数のキャプション候補を区切ることができ、ステップごとにランダムに一つが選ばれます。fine tuning 方式のメタデータファイルでは `caption` に文字列のリストも指定できます。詳細は[データセット設定のドキュメント](./docs/config_README-ja.md#改行を含むキャプションと複数のキャプション候補enable_multiline_caption--true-の場合)をご覧ください。
+        - `.txt` のサンプルプロンプトファイルで、`\n`（バックスラッシュ + n）が改行に変換されるようになりました。
+        - 複数行キャプションで `caption_prefix` / `caption_suffix` が 1 行目 / 最終行にしか付かなかった問題を修正しました（`enable_wildcard` 有効時は prefix が 1 行目、suffix が最終行にのみ付き、無効時は suffix が消えていました）。
+    - Text Encoder の出力をキャッシュする場合（`--cache_text_encoder_outputs`）に、`caption_prefix` / `caption_suffix`、`secondary_separator`、複数行キャプションの 1 行目への切り詰めが適用されず、キャプションがそのままエンコードされていた問題を修正しました。[Issue #2453](https://github.com/kohya-ss/sd-scripts/issues/2453)
+        - これらのオプションを `--cache_text_encoder_outputs_to_disk` と併用している場合は、既存のキャッシュファイル（`*_te.npz` など）を削除し、処理後のキャプションで作り直してください。
+        - `enable_wildcard` はキャッシュされた出力には適用できません（キャプションはそのままエンコードされます）。この場合に警告を表示するようになりました。
+        - 独自のキャッシュ戦略を実装している場合: `TextEncoderOutputsCachingStrategy.cache_batch_outputs` に、処理後のキャプションを渡す `captions` 引数が追加されています。
+    - `--lr_scheduler_type` でカスタムの学習率スケジューラを指定した場合に、sd-scripts が計算した総学習ステップ数と warmup ステップ数を、`num_training_steps` と `num_warmup_steps` としてスケジューラに渡すようにしました。[Issue #2444](https://github.com/kohya-ss/sd-scripts/issues/2444)
+        - スケジューラのコンストラクタがこの名前の引数を持つ場合のみ渡されます。`--lr_scheduler_args` で明示的に指定した値が優先されます。異なる名前の引数（`total_steps` など）を使うスケジューラには影響しませんので、従来通り `--lr_scheduler_args` で指定してください。
+        - `num_training_steps` を持つカスタムスケジューラを `--lr_scheduler_args` で指定せずに使っていた場合、これまではスケジューラのデフォルト値で動作していましたが、今後は実際の学習ステップ数が使われますのでご注意ください。同様に、`num_warmup_steps` を持つスケジューラには `--lr_warmup_steps` が渡されるようになります（従来はエラーになっていました）。
+
+- **Version 0.12.0 (2026-09-24):**
+    - Windows on ARM64（NVIDIA RTX Spark PC など）に対応しました。[PR #2430](https://github.com/kohya-ss/sd-scripts/pull/2430)、[PR #2431](https://github.com/kohya-ss/sd-scripts/pull/2431)、[PR #2433](https://github.com/kohya-ss/sd-scripts/pull/2433)
+        - `opencv-python` がオプションになり（未インストール時は Pillow/NumPy による代替実装を使用）、`requirements.txt` が Windows ARM64 用 wheel のあるパッケージを自動的に選択するようになりました。詳細は[OpenCVなしでのインストール／Windows on ARM64について](#opencvなしでのインストールwindows-on-arm64について)をご覧ください。
+        - `requirements.txt` の `transformers`、`schedulefree`、`safetensors` を Windows ARM64 用 wheel が提供されているバージョンに更新しました。
+    - `requirements.txt` の依存関係を更新しました: `transformers` 4.57.6 → 5.5.4、`diffusers` 0.32.1 → 0.40.0、`accelerate` 1.6.0 → 1.15.0、`huggingface-hub` 0.34.3 → 1.32.0。[PR #2436](https://github.com/kohya-ss/sd-scripts/pull/2436)
+        - 主にセキュリティ上の保守のための更新です（`transformers` 4.x 系と `diffusers` 0.38 未満には修正が提供されなくなっています）。以前のバージョンのライブラリでもこのリリースは動作しますので、すぐに更新する必要はありませんが、なるべく早めに `pip install --upgrade -r requirements.txt` を実行することをお勧めします。
+        - `diffusers` 0.40 は PyTorch 2.6 以降を必要とします（sd-scripts はすでに PyTorch 2.6.0 以降を必要としています）。CI は PyTorch 2.6.0 と 2.8.0 でテストするようになりました。
+        - `transformers` 5.x の `CLIPTokenizer` は、オリジナルの CLIP トークナイザが行っていた `ftfy` によるテキスト正規化（曲がった引用符の直線化、全角文字の半角化など）を行わなくなりました。sd-scripts 側で同じ正規化を行うようにしたため、トークナイズ結果は従来と変わりません。
+        - `tests/local` のローカル回帰テストにより、Text Encoder の出力、VAE の出力、ノイズスケジューラが従来のバージョンと同一であることを確認しています。
+        - `diffusers` 0.40 は `.to(dtype)` のたびに "There are modules in AutoencoderKL that should be kept in float32: [] ..." という誤った警告を出します（リストが空でも警告する diffusers 側のバグ）。sd-scripts ではリストが空の場合にこの警告を抑制しています。
+    - `transformers` 5.6 以降に対応し、`requirements.txt` の `transformers` を 5.17.0 に更新しました。[PR #2437](https://github.com/kohya-ss/sd-scripts/pull/2437)
+        - `transformers` 5.6 で `CLIPTextModel` の内部構造が変わりました（`text_model` サブモジュールが無くなりました）。sd-scripts ではモデルをラップすることで、チェックポイントのキー、Text Encoder の LoRA の重み名（`lora_te_text_model_...`）、`text_encoder.text_model.*` によるアクセスが従来と変わらないようにしています。`transformers` 5.6 未満ではラップは行われず、何も変わりません。
+        - また `transformers` 5.6 では T5（FLUX.1 / SD3 の T5-XXL、HunyuanImage の byT5）の attention の実装が SDPA に切り替わり、高速化・省メモリ化が期待できます。T5 の bf16/fp16 出力は従来のバージョンからごくわずかに変わります（T5-XXL でコサイン類似度 ≈ 0.998、fp32 に対する精度は同等）。生成画像や学習結果の細部が変わる可能性がありますが、以前のバージョンでキャッシュした Text Encoder 出力もそのまま使えます。他の Text Encoder の出力は同一です。
+        - 上記と同様に、以前のバージョンの `transformers` でも動作しますが、`pip install --upgrade -r requirements.txt` での更新をお勧めします。
+    - SD1.x / SD2.x / SDXL の学習向けに、OFTv2 と BOFT のネットワークモジュール（`networks.oft_v2`、`networks.boft`）を追加しました。[PR #2357](https://github.com/kohya-ss/sd-scripts/pull/2357)
+        - PEFT の実装に準拠した直交変換系のアダプタです。PEFT 形式の重みも読み込めます。umisetokikaze 氏に感謝します。
+        - これらのモジュールでは `--network_dim` はブロックサイズを意味します。詳細は[ドキュメント](./docs/train_network_oft_boft.md)をご覧ください。
+    - FLUX.1 および Anima の LoRA 学習で、サブセットごとの timestep sampling offset（`custom_attributes.timestep_sampling.offset`）を追加しました。[PR #2401](https://github.com/kohya-ss/sd-scripts/pull/2401) okdsf 氏に感謝します。
+        - データセットのサブセットごとに、timestep のサンプリング分布を低ノイズ側または高ノイズ側へ偏らせることができます。詳細は[ドキュメント](./docs/timestep_sampling_offset.md)をご覧ください。
+    - `--show_timesteps` 使用時に offset を適用した timestep の分布を確認できる `--show_timesteps_offset` を追加しました。[PR #2410](https://github.com/kohya-ss/sd-scripts/pull/2410)
+        - `shift` / `flux_shift` の timestep sampling における offset の挙動もドキュメントに記載しました。
+    - SD1.x / SD2.x 用の古い画像生成スクリプト `gen_img_diffusers.py` を削除しました。しばらく前から動作しておらず（リファクタリングで削除された関数に依存していました）、実験的な CLIP / VGG16 guidance を除くすべての機能は `gen_img.py` でサポートされています。代わりに `gen_img.py` をお使いください（[gen_img_README-ja.md](./docs/gen_img_README-ja.md) をご覧ください）。ファイルは以前のリリースから取得できます。[PR #2439](https://github.com/kohya-ss/sd-scripts/pull/2439)
+    - 学習中のサンプル画像生成の `--sample_sampler`、および `gen_img.py` / `sdxl_gen_img.py` の `--sampler` で、`dpmsolver` と `dpmsingle` を指定すると最近のバージョンの `diffusers` でエラーになる問題を修正しました。[PR #2438](https://github.com/kohya-ss/sd-scripts/pull/2438)
+        - `lms` / `k_lms` サンプラーには `requirements.txt` に含まれない `scipy` パッケージが必要です。`scipy` が未インストールの場合、（最初のサンプル生成時ではなく）起動時に分かりやすいエラーを表示するようにしました。使用する場合は `pip install scipy` を実行してください。
 
 ### サポートモデル
 
@@ -90,6 +148,7 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 * **LUMINA**
 * **HunyuanImage-2.1**
 * **Anima**
+* **MOSS-Image**
 
 ### 機能
 
@@ -109,11 +168,14 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 * [LoRA学習の概要](./docs/train_network.md)
 * [データセット設定](./docs/config_README-ja.md) / [英語版](./docs/config_README-en.md)
 * [高度な学習オプション](./docs/train_network_advanced.md)
+* [OFTv2 / BOFT学習](./docs/train_network_oft_boft.md)
 * [SDXL学習](./docs/sdxl_train_network.md)
 * [SD3学習](./docs/sd3_train_network.md)
 * [FLUX.1学習](./docs/flux_train_network.md)
 * [LUMINA学習](./docs/lumina_train_network.md)
 * [HunyuanImage-2.1学習](./docs/hunyuan_image_train_network.md)
+* [Anima学習](./docs/anima_train_network.md)
+* [MOSS-Image学習](./docs/moss_image_train_network.md)
 * [Fine-tuning](./docs/fine_tune.md)
 * [Textual Inversion学習](./docs/train_textual_inversion.md)
 * [ControlNet-LLLite学習](./docs/train_lllite_README-ja.md) / [英語版](./docs/train_lllite_README.md)
@@ -121,6 +183,10 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 * [Validation](./docs/validation.md)
 * [マスク損失学習](./docs/masked_loss_README-ja.md) / [英語版](./docs/masked_loss_README.md)
 * [インペインティング学習](./docs/inpainting_training.md)
+* [1プロセスでのマルチGPU学習（レプリカ学習）](./docs/replica_training.md)
+* [LoRAのPost-Hoc EMAマージ](./docs/lora_post_hoc_ema.md)
+* [実行中の学習の観測と操作（Run Control）](./docs/run_control.md)
+* [学習を運用する AI エージェント向けガイド](./docs/agent_guide.md)（英語。学習の起動と見守りを AI コーディングエージェントに任せるときに読ませてください）
 
 ### その他のドキュメント
 
@@ -244,6 +310,22 @@ PyTorchは環境によってバージョンが異なるため、requirements.txt
 スクリプトはPyTorch 2.6.0でテストしています。PyTorch 2.6.0以降が必要です。
 
 RTX 50シリーズGPUの場合、PyTorch 2.8.0とCUDA 12.8/12.9を使用してください。`requirements.txt`はこのバージョンでも動作します。
+
+### OpenCVなしでのインストール／Windows on ARM64について
+
+`opencv-python` は `requirements.txt` に含まれていますが、学習・データセット処理パイプラインが利用している OpenCV 機能は限定的です（主に `cv2.resize`、`cv2.cvtColor`、およびデバッグ用の `cv2.imshow`）。`opencv-python` がインストールされていない場合、Pillow と NumPy による軽量な代替実装（`library/_cv2_stub`）が自動的に `cv2` として登録されるため、既存のスクリプトはそのまま動作します。OpenCV の大きなインストールを避けたい場合は、requirements のインストール後にアンインストールしてください：
+
+```bash
+pip uninstall opencv-python
+```
+
+Windows on ARM64（たとえば NVIDIA RTX Spark PC など）では `opencv-python` のビルド済み wheel が提供されていないため、`requirements.txt` の環境マーカーにより自動的にスキップされます。通常どおり `pip install --upgrade -r requirements.txt` でインストールできます。同じ理由で、このプラットフォームでは `tensorboard` の代わりに `tensorboardX` がインストールされます（TensorBoard 2.x が依存する `grpcio` に Windows ARM64 用 wheel がないため）。`--log_with tensorboard` でのログ出力は `tensorboardX` 経由でそのまま動作します。ログの閲覧は別のマシンの TensorBoard で行ってください。
+
+以下に注意してください：
+
+- OpenCV を含むデフォルトのインストールが推奨される経路です。代替実装は、データセット処理がデフォルトで使う `INTER_AREA` と `INTER_LINEAR` のリサイズを NumPy で OpenCV と同じ計算で再現しているため、学習結果は丸め誤差の範囲で一致しますが、OpenCV より低速です（2400 万画素の画像 1 枚あたり 0.1 秒程度）。`INTER_CUBIC` / `INTER_LANCZOS4` は Pillow を経由するため、わずかに結果が異なります。
+- 次のツールは実際の `opencv-python` を必要とし、未インストール時は明確なメッセージで終了します：`tools/canny.py`、`tools/detect_face_rotate.py`、および `gen_img.py` / `sdxl_gen_img.py` の ControlNet `canny` プリプロセッサ。
+- データセット確認時の `cv2.imshow` は、OpenCV が無い場合 Pillow 標準のビューア（`PIL.Image.show`）で表示され、`cv2.waitKey` はターミナルでの `input()` 待ちに置き換わります（1枚ずつ確認できます）。
 
 ### xformersのインストール（オプション）
 
