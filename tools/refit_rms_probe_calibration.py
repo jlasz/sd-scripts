@@ -25,7 +25,8 @@ CROSSBREED_STAGE_SHAPE = np.mean(CROSSBREED_STAGE_SHAPES, axis=0)
 MARCIA_STAGE_VELOCITIES = np.asarray(
     (
         # 1,550-step and 2,400-step completed GA-5 schedules, followed by
-        # the 1,700-step GA-11 and 2,000-step GA-9 schedules.
+        # the 1,700-step GA-11, 2,000-step GA-9, and 1,600-step GA-14
+        # schedules.
         (2.400155e-8, 2.210202e-8, 2.322872e-8, 2.293994e-8),
         (
             2.312615460080274e-8,
@@ -44,6 +45,12 @@ MARCIA_STAGE_VELOCITIES = np.asarray(
             2.9396111418272515e-8,
             3.026081558026929e-8,
             3.3129234859523805e-8,
+        ),
+        (
+            3.2393149642857146e-8,
+            3.2821576428571425e-8,
+            3.62915244642857e-8,
+            3.921755392857143e-8,
         ),
     )
 )
@@ -67,17 +74,46 @@ BEASTGIRL_STAGE_SHAPES = np.asarray(
             1.0525559010097465,
             1.1129573624887577,
         ),
+        (
+            0.880320904149621,
+            0.9925945694574024,
+            1.0112713618724714,
+            1.1158131645205052,
+        ),
     )
 )
 BEASTGIRL_STAGE_SHAPE = np.mean(BEASTGIRL_STAGE_SHAPES, axis=0)
+# Completed GA-6 001 production curves: 4,200 steps with 122 batches per
+# epoch, then 4,600 steps with the revised 119-batch dataset.
+OBJECT_CHARACTER_001_STAGE_SHAPES = np.asarray(
+    (
+        (
+            0.9349471823737898,
+            1.0010818367081487,
+            1.0125576404927095,
+            1.0514133404253514,
+        ),
+        (
+            0.955489716862284,
+            0.9810965097925542,
+            1.017635837089424,
+            1.0457779362557378,
+        ),
+    )
+)
+OBJECT_CHARACTER_001_STAGE_SHAPE = np.mean(
+    OBJECT_CHARACTER_001_STAGE_SHAPES,
+    axis=0,
+)
 STAGE_FACTORS = tuple(
     (
         6.0 * PRIOR_STAGE_FACTORS
         + CROSSBREED_STAGE_SHAPE
         + MARCIA_STAGE_SHAPE
         + BEASTGIRL_STAGE_SHAPE
+        + OBJECT_CHARACTER_001_STAGE_SHAPE
     )
-    / 9.0
+    / 10.0
 )
 
 # Per-family means of retained_energy_mean. M'rissi predates this telemetry.
@@ -99,18 +135,58 @@ RETENTION_FAMILY_MEANS = {
     ),
     "marcia": np.asarray(
         (
-            np.mean((0.9397159218788147, 0.9446578025817871, 0.9477311372756958, 0.9459108114242554)),
-            np.mean((0.931081235408783, 0.9350574016571045, 0.938911497592926, 0.9370183348655701)),
-            np.mean((0.9144988656044006, 0.9179385900497437, 0.9211618900299072, 0.9195295572280884)),
-            np.mean((0.8838304877281189, 0.8856008052825928, 0.8903316855430603, 0.8870620727539062)),
+            np.mean(
+                (
+                    0.9397159218788147,
+                    0.9446578025817871,
+                    0.9477311372756958,
+                    0.9459108114242554,
+                    0.947370,
+                )
+            ),
+            np.mean(
+                (
+                    0.931081235408783,
+                    0.9350574016571045,
+                    0.938911497592926,
+                    0.9370183348655701,
+                    0.938918,
+                )
+            ),
+            np.mean(
+                (
+                    0.9144988656044006,
+                    0.9179385900497437,
+                    0.9211618900299072,
+                    0.9195295572280884,
+                    0.921458,
+                )
+            ),
+            np.mean(
+                (
+                    0.8838304877281189,
+                    0.8856008052825928,
+                    0.8903316855430603,
+                    0.8870620727539062,
+                    0.891531,
+                )
+            ),
         )
     ),
     "beastgirl": np.asarray(
         (
-            np.mean((0.9472075700759888, 0.953414797782898)),
-            np.mean((0.9393881559371948, 0.9455373883247375)),
-            np.mean((0.924223780632019, 0.9300624132156372)),
-            np.mean((0.8950448036193848, 0.8998176455497742)),
+            np.mean((0.9472075700759888, 0.953414797782898, 0.9501983523368835)),
+            np.mean((0.9393881559371948, 0.9455373883247375, 0.9429237842559814)),
+            np.mean((0.924223780632019, 0.9300624132156372, 0.927065372467041)),
+            np.mean((0.8950448036193848, 0.8998176455497742, 0.8984496593475342)),
+        )
+    ),
+    "object_character_001": np.asarray(
+        (
+            np.mean((0.9328334331512451, 0.932612)),
+            np.mean((0.9219856262207031, 0.920868)),
+            np.mean((0.9042553901672363, 0.902960)),
+            np.mean((0.8709542155265808, 0.868698)),
         )
     ),
 }
@@ -124,8 +200,9 @@ SQUEEZE_RETENTION = tuple(
         + RETENTION_FAMILY_MEANS["crossbreed_priscilla"]
         + RETENTION_FAMILY_MEANS["marcia"]
         + RETENTION_FAMILY_MEANS["beastgirl"]
+        + RETENTION_FAMILY_MEANS["object_character_001"]
     )
-    / 9.0
+    / 10.0
 )
 FAMILY_SHARES = {
     "mrissi": 1.0,
@@ -137,6 +214,7 @@ FAMILY_SHARES = {
     "crossbreed_priscilla": 1.0,
     "marcia": 1.0,
     "beastgirl": 1.0,
+    "object_character_001": 1.0,
 }
 
 
@@ -179,11 +257,13 @@ ROWS = (
     # The second run probed and trained at GA 7, so no GA transfer is needed.
     CalibrationRow("crossbreed_priscilla", 93, 3.842611053225904e-5, 7, 2.0053641727895593, 3700, 8.623025450275907e-5),
     # Same-GA schedule-aware Probe-1 views from the completed 1,550-, 2,400-,
-    # 1,700-, and 2,000-step Marcia trajectories. They split one family share.
+    # 1,700-, 2,000-, and 1,600-step Marcia trajectories. They split one
+    # family share.
     CalibrationRow("marcia", 22, 4.7060277489e-5, 5, 2.1234049812, 1550, 5.9780546789e-5),
     CalibrationRow("marcia", 22, 5.0705232640351776e-5, 5, 2.1984010211552754, 2400, 8.776551913866043e-5),
     CalibrationRow("marcia", 22, 6.54549402987649e-5, 11, 2.306234594209267, 1700, 9.212609184623723e-5),
     CalibrationRow("marcia", 27, 5.4083582557090604e-5, 9, 2.17195124877972, 2000, 9.194107419552754e-5),
+    CalibrationRow("marcia", 28, 6.351642683420896e-5, 14, 2.1520303378229664, 1600, 8.818310969338425e-5),
     # Same-GA schedule-aware views of the completed Beastgirl trajectories.
     CalibrationRow(
         "beastgirl",
@@ -202,6 +282,35 @@ ROWS = (
         2.2177239901442296,
         1600,
         8.717409915077944e-5,
+    ),
+    CalibrationRow(
+        "beastgirl",
+        24,
+        6.72222426902599e-5,
+        12,
+        2.2565366390239823,
+        1450,
+        7.998233372321603e-5,
+    ),
+    CalibrationRow(
+        # The two 001 revisions split one object-and-character family share.
+        # Tkl is intentionally excluded from every calibration aggregate.
+        "object_character_001",
+        122,
+        3.8101557082479796e-5,
+        6,
+        2.0491012957960426,
+        4200,
+        7.982355725304759e-5,
+    ),
+    CalibrationRow(
+        "object_character_001",
+        119,
+        3.8070918e-5,
+        6,
+        2.0700419993815973,
+        4600,
+        8.69400831157966e-5,
     ),
 )
 

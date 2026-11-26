@@ -231,7 +231,7 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=6,
         )
 
-        self.assertEqual(steps, 5637)
+        self.assertEqual(steps, 5711)
         self.assertAlmostEqual(multiplier, steps / 4000)
         self.assertEqual(
             details["later_mean_rms_velocity_gradient_accumulation_steps"], 6.0
@@ -239,7 +239,7 @@ class RMSStepProbeTest(unittest.TestCase):
         self.assertEqual(
             details["later_mean_rms_velocity_uses_augmented_regression"], 1.0
         )
-        self.assertEqual(details["trajectory_model_version"], 2.5)
+        self.assertEqual(details["trajectory_model_version"], 2.9)
         self.assertEqual(details["later_energy_exponent"], 0.5)
         self.assertGreaterEqual(details["predicted_final_rms"], 8.425384599385171e-5)
         self.assertLess(
@@ -264,7 +264,7 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=5,
         )
 
-        self.assertEqual(steps, 2023)
+        self.assertEqual(steps, 2043)
         self.assertTrue(probe_schedule_needs_adjusted_probe(steps, 500))
 
     def test_piecewise_energy_solver_can_extrapolate_below_calibration_reference(self):
@@ -337,7 +337,7 @@ class RMSStepProbeTest(unittest.TestCase):
             rounded_steps, 24000, 6, rounding_bias=0.7
         )
 
-        self.assertEqual(steps, 1904)
+        self.assertEqual(steps, 1939)
         self.assertAlmostEqual(details["probe_energy_slope_per_1000_steps"], 2.2019441770164145)
         self.assertEqual(
             details["later_mean_rms_velocity_uses_augmented_regression"], 1.0
@@ -898,8 +898,8 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=6,
         )
 
-        self.assertEqual(estimated_steps, 5637)
-        self.assertEqual(rounded_steps, 5600)
+        self.assertEqual(estimated_steps, 5711)
+        self.assertEqual(rounded_steps, 5700)
         self.assertEqual(
             updated["estimated_steps_predicted_final_rms"],
             details["predicted_final_rms"],
@@ -928,7 +928,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 gradient_accumulation_steps=6,
                 probe_energy_slope=2.1028907100460046,
             ),
-            0.3411021579398432,
+            0.33780371929157293,
         )
         self.assertAlmostEqual(
             estimate_augmented_later_mean_rms_velocity(
@@ -937,7 +937,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 gradient_accumulation_steps=5,
                 probe_energy_slope=2.063401097961805,
             ),
-            0.2938988774326825,
+            0.29141287368000257,
         )
         self.assertGreater(
             estimate_augmented_later_mean_rms_velocity(
@@ -962,7 +962,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 gradient_accumulation_steps=6,
                 probe_energy_slope=2.1028907100460046,
             ),
-            0.3886930824473399,
+            0.3854598627365411,
         )
         self.assertAlmostEqual(
             estimate_augmented_later_mean_rms_velocity(
@@ -971,7 +971,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 gradient_accumulation_steps=20,
                 probe_energy_slope=2.2019441770164145,
             ),
-            0.7706214028651794,
+            0.754891222778256,
         )
 
     def test_crossbreed_priscilla_repeats_share_one_calibration_family(self):
@@ -984,7 +984,7 @@ class RMSStepProbeTest(unittest.TestCase):
             probe_energy_slope=production_energy_slope,
         )
 
-        self.assertAlmostEqual(velocity, 0.4215090855984129)
+        self.assertAlmostEqual(velocity, 0.4174372650476631)
         self.assertAlmostEqual(
             predict_piecewise_energy_final_rms(
                 total_steps=3300,
@@ -994,7 +994,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 probe_energy_slope=production_energy_slope,
                 gradient_accumulation_steps=7,
             ),
-            7.663709825648023e-5,
+            7.622351066935624e-5,
             delta=1e-11,
         )
         second_velocity = estimate_augmented_later_mean_rms_velocity(
@@ -1003,7 +1003,7 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=7,
             probe_energy_slope=2.0053641727895593,
         )
-        self.assertAlmostEqual(second_velocity, 0.44997759351409644)
+        self.assertAlmostEqual(second_velocity, 0.4418091197806908)
         self.assertAlmostEqual(
             predict_piecewise_energy_final_rms(
                 total_steps=3700,
@@ -1013,7 +1013,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 probe_energy_slope=2.0053641727895593,
                 gradient_accumulation_steps=7,
             ),
-            8.597601409461278e-5,
+            8.50853442072068e-5,
             delta=1e-11,
         )
 
@@ -1046,9 +1046,9 @@ class RMSStepProbeTest(unittest.TestCase):
             (500, 5.124977542436682e-5),
         ]
         cases = (
-            (250, 3.238666795368772e-5, 2391, 0.5421363705238864, False),
-            (400, None, 2320, 0.507106301525716, False),
-            (500, None, 2263, 0.5256193218119138, True),
+            (250, 3.238666795368772e-5, 2392, 0.5421428184963475, False),
+            (400, None, 2313, 0.5098433373718041, False),
+            (500, None, 2264, 0.5255771690775687, True),
         )
 
         for (
@@ -1123,16 +1123,16 @@ class RMSStepProbeTest(unittest.TestCase):
             probe_energy_slope=energy_slope,
         )
 
-        self.assertAlmostEqual(velocity, 0.5823942826949035)
-        self.assertAlmostEqual(predicted_rms, 9.091825952050881e-5, delta=1e-11)
-        self.assertEqual(estimated_steps, 1550)
+        self.assertAlmostEqual(velocity, 0.5749667396649231)
+        self.assertAlmostEqual(predicted_rms, 9.027195362013741e-5, delta=1e-11)
+        self.assertEqual(estimated_steps, 1564)
 
     def test_adjusted_probe_retention_scale_uses_observed_stage_means(self):
         scale, details = fit_observed_squeeze_retention_scale(
             (0.9446578025817871, 0.9350574016571045)
         )
 
-        self.assertAlmostEqual(scale, 1.0109461058072509)
+        self.assertAlmostEqual(scale, 1.0111555687212488)
         self.assertEqual(details["observed_squeeze_retention_count"], 2.0)
         self.assertGreater(
             predict_piecewise_energy_final_rms(
@@ -1184,9 +1184,9 @@ class RMSStepProbeTest(unittest.TestCase):
             probe_energy_slope=energy_slope,
         )
 
-        self.assertAlmostEqual(velocity, 0.5558603433763911)
-        self.assertAlmostEqual(predicted_rms, 8.407334427718716e-5, delta=1e-11)
-        self.assertEqual(estimated_steps, 2206)
+        self.assertAlmostEqual(velocity, 0.5579587838277081)
+        self.assertAlmostEqual(predicted_rms, 8.421124087177094e-5, delta=1e-11)
+        self.assertEqual(estimated_steps, 2202)
 
     def test_latest_marcia_and_beastgirl_runs_update_their_family_calibrations(self):
         cases = (
@@ -1196,9 +1196,9 @@ class RMSStepProbeTest(unittest.TestCase):
                 9,
                 2.17195124877972,
                 2000,
-                0.5857967214769391,
-                8.642160908925187e-5,
-                1938,
+                0.5777016831591206,
+                8.574137905547667e-5,
+                1957,
             ),
             (
                 22,
@@ -1206,9 +1206,29 @@ class RMSStepProbeTest(unittest.TestCase):
                 11,
                 2.2177239901442296,
                 1600,
-                0.6084043148097441,
-                8.6690026686911e-5,
-                1545,
+                0.5982065162195691,
+                8.588830549370317e-5,
+                1563,
+            ),
+            (
+                28,
+                6.351642683420896e-5,
+                14,
+                2.1520303378229664,
+                1600,
+                0.6108336723106391,
+                8.698079864106743e-5,
+                1538,
+            ),
+            (
+                24,
+                6.72222426902599e-5,
+                12,
+                2.2565366390239823,
+                1450,
+                0.5782365025230364,
+                8.197173866498265e-5,
+                1500,
             ),
         )
 
@@ -1242,6 +1262,62 @@ class RMSStepProbeTest(unittest.TestCase):
                 dataset_batches_per_epoch=bpe,
                 rms_curve=(),
                 gradient_accumulation_steps=ga,
+                probe_energy_slope=slope,
+            )
+            self.assertEqual(estimated_steps, target_steps)
+
+    def test_object_character_001_revisions_share_one_calibration_family(self):
+        cases = (
+            (
+                122,
+                3.8101557082479796e-5,
+                2.0491012957960426,
+                4200,
+                0.3652617154442301,
+                8.423485255994249e-5,
+                4202,
+            ),
+            (
+                119,
+                3.8070918e-5,
+                2.0700419993815973,
+                4600,
+                0.36552900391642135,
+                9.034639913841768e-5,
+                4199,
+            ),
+        )
+
+        for bpe, reference_rms, slope, steps, velocity, predicted_rms, target_steps in cases:
+            self.assertAlmostEqual(
+                estimate_augmented_later_mean_rms_velocity(
+                    dataset_batches_per_epoch=bpe,
+                    observed_rms=reference_rms,
+                    gradient_accumulation_steps=6,
+                    probe_energy_slope=slope,
+                ),
+                velocity,
+            )
+            self.assertAlmostEqual(
+                predict_piecewise_energy_final_rms(
+                    total_steps=steps,
+                    probe_steps=500,
+                    observed_rms=reference_rms,
+                    dataset_batches_per_epoch=bpe,
+                    probe_energy_slope=slope,
+                    gradient_accumulation_steps=6,
+                ),
+                predicted_rms,
+                delta=1e-11,
+            )
+            estimated_steps, _, _ = estimate_piecewise_energy_adjusted_steps(
+                original_steps=steps,
+                final_target_rms=8.425384599385171e-5,
+                observed_rms=reference_rms,
+                probe_steps=500,
+                dataset_batches_per_epoch=bpe,
+                rms_curve=(),
+                gradient_accumulation_steps=6,
                 probe_energy_slope=slope,
             )
             self.assertEqual(estimated_steps, target_steps)
@@ -1309,16 +1385,16 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=10,
             probe_energy_slope=2.166961419148628,
         )
-        self.assertAlmostEqual(first_later_velocity, 0.38860560617784895)
-        self.assertAlmostEqual(second_later_velocity, 0.408847228866358)
-        self.assertAlmostEqual(third_later_velocity, 0.3767919143751221)
-        self.assertAlmostEqual(low_accumulation_later_velocity, 0.20847677352409372)
-        self.assertAlmostEqual(fourth_later_velocity, 0.34699761198358264)
-        self.assertAlmostEqual(second_low_accumulation_later_velocity, 0.19881123373522133)
-        self.assertAlmostEqual(fifth_later_velocity, 0.39896420157300494)
-        self.assertAlmostEqual(sixth_later_velocity, 0.33813564051951756)
-        self.assertAlmostEqual(seventh_later_velocity, 0.34847114168969356)
-        self.assertAlmostEqual(ga10_later_velocity, 0.4155125104108447)
+        self.assertAlmostEqual(first_later_velocity, 0.3837653883036998)
+        self.assertAlmostEqual(second_later_velocity, 0.40370835130625743)
+        self.assertAlmostEqual(third_later_velocity, 0.3721452449511561)
+        self.assertAlmostEqual(low_accumulation_later_velocity, 0.21739231770890893)
+        self.assertAlmostEqual(fourth_later_velocity, 0.34428137146932386)
+        self.assertAlmostEqual(second_low_accumulation_later_velocity, 0.20525664481186984)
+        self.assertAlmostEqual(fifth_later_velocity, 0.3915504334595167)
+        self.assertAlmostEqual(sixth_later_velocity, 0.3336253531105056)
+        self.assertAlmostEqual(seventh_later_velocity, 0.34395955655614197)
+        self.assertAlmostEqual(ga10_later_velocity, 0.4070921405697654)
         self.assertAlmostEqual(
             predict_piecewise_energy_final_rms(
                 total_steps=3400,
@@ -1328,7 +1404,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 probe_energy_slope=2.1487726165980137,
                 gradient_accumulation_steps=9,
             ),
-            8.770984785814487e-5,
+            8.684874159585946e-5,
             delta=1e-11,
         )
         self.assertAlmostEqual(
@@ -1340,7 +1416,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 probe_energy_slope=2.0936642515103694,
                 gradient_accumulation_steps=6,
             ),
-            9.155595461332743e-5,
+            9.091778286432574e-5,
             delta=1e-11,
         )
         fifth_estimated_steps, _, _ = estimate_piecewise_energy_adjusted_steps(
@@ -1383,10 +1459,10 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=10,
             probe_energy_slope=2.166961419148628,
         )
-        self.assertEqual(fifth_estimated_steps, 3227)
-        self.assertEqual(newest_estimated_steps, 3760)
-        self.assertEqual(seventh_estimated_steps, 3395)
-        self.assertEqual(ga10_estimated_steps, 2932)
+        self.assertEqual(fifth_estimated_steps, 3269)
+        self.assertEqual(newest_estimated_steps, 3795)
+        self.assertEqual(seventh_estimated_steps, 3425)
+        self.assertEqual(ga10_estimated_steps, 2973)
         self.assertAlmostEqual(
             predict_piecewise_energy_final_rms(
                 total_steps=3300,
@@ -1396,7 +1472,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 probe_energy_slope=2.1870861288967656,
                 gradient_accumulation_steps=8,
             ),
-            8.532988679788119e-5,
+            8.476787276067509e-5,
             delta=1e-11,
         )
         self.assertAlmostEqual(
@@ -1408,7 +1484,7 @@ class RMSStepProbeTest(unittest.TestCase):
                 probe_energy_slope=2.216775240715489,
                 gradient_accumulation_steps=9,
             ),
-            8.15073317213943e-5,
+            8.09645622362097e-5,
             delta=1e-11,
         )
         first_estimated_steps, _, _ = estimate_piecewise_energy_adjusted_steps(
@@ -1431,8 +1507,8 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=9,
             probe_energy_slope=2.216775240715489,
         )
-        self.assertEqual(first_estimated_steps, 3246)
-        self.assertEqual(second_estimated_steps, 3132)
+        self.assertEqual(first_estimated_steps, 3275)
+        self.assertEqual(second_estimated_steps, 3160)
 
     def test_piecewise_energy_calibration_reproduces_augmented_predictions(self):
         mrissi_predicted = predict_piecewise_energy_final_rms(
@@ -1460,9 +1536,9 @@ class RMSStepProbeTest(unittest.TestCase):
             gradient_accumulation_steps=5,
         )
 
-        self.assertAlmostEqual(mrissi_predicted, 8.009500564063748e-5, delta=1e-11)
-        self.assertAlmostEqual(wilykit_predicted, 8.103016906327963e-5, delta=1e-11)
-        self.assertAlmostEqual(wilykit_second_predicted, 8.874969426556789e-5, delta=1e-11)
+        self.assertAlmostEqual(mrissi_predicted, 7.96845072766962e-5, delta=1e-11)
+        self.assertAlmostEqual(wilykit_predicted, 8.067478284928558e-5, delta=1e-11)
+        self.assertAlmostEqual(wilykit_second_predicted, 8.83497147449849e-5, delta=1e-11)
 
     def test_gradient_accumulation_uses_biased_nearest_microbatch_budget(self):
         self.assertEqual(choose_gradient_accumulation_steps(3000, 24000, 6), 8)
@@ -1582,7 +1658,7 @@ class RMSStepProbeTest(unittest.TestCase):
             later_mean_rms_velocity_reference_gradient_accumulation_steps=9,
         )
 
-        self.assertEqual(estimated_steps, 3158)
+        self.assertEqual(estimated_steps, 3153)
         self.assertEqual(adjusted_steps, 3200)
         self.assertEqual(uncapped_accumulation, 8)
         self.assertEqual(adjusted_accumulation, 8)
@@ -1604,7 +1680,7 @@ class RMSStepProbeTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             details["observed_later_mean_rms_velocity_accumulation_scale"],
-            0.9625259717164174,
+            0.9650090239948089,
         )
 
     def test_marcia_probe_two_transfers_probe_one_rank36_anchor(self):
@@ -1721,13 +1797,13 @@ class RMSStepProbeTest(unittest.TestCase):
             later_mean_rms_velocity_reference_gradient_accumulation_steps=22,
         )
 
-        self.assertEqual(second_only_plan[0], 1434)
+        self.assertEqual(second_only_plan[0], 1435)
         self.assertAlmostEqual(
             transfer_details["rank36_transfer_rms_scale"],
             1.0023300289993526,
         )
         self.assertEqual(transfer_details["rank36_transfer_sample_count"], 3.0)
-        self.assertAlmostEqual(observed_later_velocity, 0.6672413879120938)
+        self.assertAlmostEqual(observed_later_velocity, 0.6669061655405474)
         self.assertAlmostEqual(
             old_observed_later_velocity * adjusted_reference_rms,
             observed_later_velocity * transferred_reference_rms,
@@ -1739,7 +1815,7 @@ class RMSStepProbeTest(unittest.TestCase):
             anchored_plan[5]["gradient_accumulation_is_epoch_compatible"],
             1.0,
         )
-        self.assertEqual(fixed_ga5_plan[0], 1850)
+        self.assertEqual(fixed_ga5_plan[0], 1827)
         self.assertEqual(fixed_ga5_plan[2], 1850)
         self.assertEqual(fixed_ga5_plan[4], 5)
 
@@ -1766,7 +1842,7 @@ class RMSStepProbeTest(unittest.TestCase):
             probe_energy_slope=2.216775240715489,
         )
 
-        self.assertEqual(estimated_steps, 3456)
+        self.assertEqual(estimated_steps, 3474)
         self.assertEqual(adjusted_steps, 3500)
         self.assertEqual(uncapped_accumulation, 7)
         self.assertEqual(adjusted_accumulation, 7)

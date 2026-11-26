@@ -10,14 +10,15 @@ PIECEWISE_ENERGY_POLICY = "piecewise_energy_v1"
 SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY)
 CALIBRATION_PROBE_STEPS = 500
 PROBE_ENERGY_FIT_START_STEP = 100
-TRAJECTORY_MODEL_VERSION = 2.5
+TRAJECTORY_MODEL_VERSION = 2.9
 LATER_ENERGY_EXPONENT = 0.5
 
-# Calibrated from twenty-nine Anima 36->9, four-squeeze runs across M'rissi,
+# Calibrated from thirty-three Anima 36->9, four-squeeze runs across M'rissi,
 # Izutsumi, Neeko, Wilykit, Mutio, Rosine, Crossbreed Priscilla, Marcia, and
-# Beastgirl. Rosine has
-# twice the total family weight because its ten runs intentionally span
-# substantial dataset revisions; each other family has one equal share.
+# Beastgirl, plus two revisions of the mixed object-and-character 001 dataset.
+# Rosine has twice
+# the total family weight because its ten runs intentionally span substantial
+# dataset revisions; each other family has one equal share.
 # Repeated runs divide their family's weight. The compressed-stage regression
 # uses standardized log batches per epoch, log probe RMS, log production
 # gradient accumulation, and normalized rank-36 probe energy slope. Rank 36
@@ -25,39 +26,39 @@ LATER_ENERGY_EXPONENT = 0.5
 # instead advances linearly in normalized RMS, equivalent to dE/dt proportional
 # to E**0.5.
 COMPRESSED_RMS_VELOCITY_FEATURE_MEANS = (
-    4.582216222074689,
-    -10.095460938251572,
-    1.7543419346942222,
-    2.0942333707650294,
+    4.613142092252085,
+    -10.094529015166287,
+    1.7881722220563165,
+    2.091907840499041,
 )
 COMPRESSED_RMS_VELOCITY_FEATURE_SCALES = (
-    0.8371302720401558,
-    0.17161965209933952,
-    0.35088098288465436,
-    0.0809118489347005,
+    0.7768684508256919,
+    0.1815147663136012,
+    0.36058280372456136,
+    0.07929778322517349,
 )
-COMPRESSED_RMS_VELOCITY_INTERCEPT = 0.3727373374694527
+COMPRESSED_RMS_VELOCITY_INTERCEPT = 0.3696820795204259
 COMPRESSED_RMS_VELOCITY_COEFFICIENTS = (
-    -0.1384855275828175,
-    -0.037473502598478,
-    0.0609705418058367,
-    -0.01836699122446701,
+    -0.1286926015753895,
+    -0.04127748670884288,
+    0.05865581303898875,
+    -0.015298846803360307,
 )
 # Relative four-squeeze stage factors, not absolute-rank keys. This keeps the
 # state equation independent of the literal 25/18/13/9 rank names.
 COMPRESSED_RMS_STAGE_FACTORS = (
-    0.9466713170779468,
-    0.9806775307817711,
-    1.0333464658915648,
-    1.0393046862487172,
+    0.9444806933385512,
+    0.9826392772351606,
+    1.0308213924899727,
+    1.0420586369363154,
 )
-# Family-weighted means from the twenty-eight trajectories with retained-energy
+# Family-weighted means from the thirty-two trajectories with retained-energy
 # telemetry. M'rissi predates that telemetry; Rosine keeps its double share.
 ENERGY_SQUEEZE_RETENTION = (
-    0.934829742254349,
-    0.9245369220179592,
-    0.907596647514421,
-    0.8750659573377538,
+    0.9346726002675882,
+    0.9243092958504103,
+    0.9072586769415538,
+    0.8746724149492009,
 )
 ADJUSTED_PROBE_MIN_POST_SQUEEZE_SAMPLES = 5
 
