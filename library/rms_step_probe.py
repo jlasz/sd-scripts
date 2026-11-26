@@ -7,7 +7,11 @@ from typing import Dict, Sequence, Tuple
 
 LINEAR_POLICY = "linear"
 PIECEWISE_ENERGY_POLICY = "piecewise_energy_v1"
-SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY)
+LOGLINEAR_POLICY = "loglinear_v1"
+SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY, LOGLINEAR_POLICY)
+# Policies that predict the final RMS of the Anima 36->9 four-squeeze schedule
+# from the rank-36 probe and therefore need --rms_probe_final_target.
+FINAL_TARGET_POLICIES = (PIECEWISE_ENERGY_POLICY, LOGLINEAR_POLICY)
 CALIBRATION_PROBE_STEPS = 500
 PROBE_ENERGY_FIT_START_STEP = 100
 TRAJECTORY_MODEL_VERSION = 2.9
@@ -69,6 +73,19 @@ ADJUSTED_PROBE_MIN_POST_SQUEEZE_SAMPLES = 5
 # geometrically averaged before fitting so reruns do not gain extra weight.
 PROBE_RMS_GRADIENT_ACCUMULATION_ELASTICITY = 0.13407367061621528
 PROBE_ENERGY_SLOPE_GRADIENT_ACCUMULATION_ELASTICITY = 0.028683585047468874
+
+# loglinear_v1: one log-linear fit of the final RMS, with no stage model.
+#   log(final_rms) = intercept
+#                    + steps_exponent * log(total optimizer steps)
+#                    + steps_per_epoch_exponent * log(batches per epoch / gradient accumulation)
+#                    + reference_rms_exponent * log(step-500 rank-36 reference RMS)
+# Fitted by tools/refit_rms_probe_loglinear.py on thirty-seven completed Anima
+# 36->9 four-squeeze trajectories (the piecewise table plus the third 001 run
+# and three Ahsoka runs). Leave-one-family-out endpoint MAPE is 2.4%.
+LOGLINEAR_INTERCEPT = -10.317644499406368
+LOGLINEAR_STEPS_EXPONENT = 0.7835062456574756
+LOGLINEAR_STEPS_PER_EPOCH_EXPONENT = -0.23862292006208405
+LOGLINEAR_REFERENCE_RMS_EXPONENT = 0.48139220669062843
 
 
 def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
@@ -138,7 +155,7 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
     ):
         raise ValueError("--rms_probe_gradient_accumulation_rounding_bias must be between 0 and 1")
 
-    if policy == PIECEWISE_ENERGY_POLICY:
+    if policy in FINAL_TARGET_POLICIES:
         if curve_interval <= 0:
             raise ValueError("--rms_probe_curve_every_n_steps must be greater than 0")
         periodic_curve_steps = set(range(curve_interval, steps + 1, curve_interval))
@@ -160,13 +177,13 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
         ]
         if len(rank36_fit_sample_steps) < 2:
             raise ValueError(
-                "piecewise_energy_v1 needs at least two rank-36 RMS curve samples "
+                f"{policy} needs at least two rank-36 RMS curve samples "
                 "before squeeze one; increase --max_train_steps, decrease "
                 "--rms_probe_curve_every_n_steps, or adjust the squeeze segment ratios"
             )
         if final_target is None or not math.isfinite(final_target) or final_target <= 0:
             raise ValueError(
-                "--rms_probe_final_target must be a finite value greater than 0 for piecewise_energy_v1"
+                f"--rms_probe_final_target must be a finite value greater than 0 for {policy}"
             )
         expected = {
             "lora_squeeze_start_dim": 36,
@@ -183,11 +200,18 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
         ]
         if mismatches:
             raise ValueError(
-                "piecewise_energy_v1 is calibrated for the Anima 36->9 four-squeeze schedule: "
+                f"{policy} is calibrated for the Anima 36->9 four-squeeze schedule: "
                 + ", ".join(mismatches)
             )
+        if policy == LOGLINEAR_POLICY:
+            if first_segment_ratio != 1.0 or final_segment_ratio != 1.0:
+                raise ValueError("loglinear_v1 is calibrated for equal squeeze segments only")
+            if force_adjusted_probe:
+                raise ValueError("--rms_probe_force_adjusted_probe is not used by loglinear_v1")
     elif final_target is not None:
-        raise ValueError("--rms_probe_final_target requires --rms_probe_scaling_policy=piecewise_energy_v1")
+        raise ValueError(
+            "--rms_probe_final_target requires --rms_probe_scaling_policy=piecewise_energy_v1 or loglinear_v1"
+        )
     elif force_adjusted_probe:
         raise ValueError(
             "--rms_probe_force_adjusted_probe requires "
@@ -1645,6 +1669,162 @@ def estimate_piecewise_training_plan(
     raise ValueError(
         "RMS probe could not find a stable step and gradient-accumulation "
         "combination for the hybrid trajectory model"
+    )
+
+
+def predict_loglinear_final_rms(
+    total_steps: int,
+    dataset_batches_per_epoch: int,
+    gradient_accumulation_steps: int,
+    reference_rms: float,
+) -> float:
+    """Final RMS of the 36->9 four-squeeze schedule under loglinear_v1."""
+
+    if total_steps <= 0 or dataset_batches_per_epoch <= 0 or gradient_accumulation_steps <= 0:
+        raise ValueError("steps, batches per epoch, and gradient accumulation must be greater than 0")
+    if not math.isfinite(reference_rms) or reference_rms <= 0:
+        raise ValueError("reference_rms must be a finite value greater than 0")
+    return math.exp(
+        LOGLINEAR_INTERCEPT
+        + LOGLINEAR_STEPS_EXPONENT * math.log(total_steps)
+        + LOGLINEAR_STEPS_PER_EPOCH_EXPONENT
+        * math.log(dataset_batches_per_epoch / gradient_accumulation_steps)
+        + LOGLINEAR_REFERENCE_RMS_EXPONENT * math.log(reference_rms)
+    )
+
+
+def estimate_loglinear_steps(
+    final_target_rms: float,
+    dataset_batches_per_epoch: int,
+    gradient_accumulation_steps: int,
+    reference_rms: float,
+) -> int:
+    """Invert loglinear_v1 for the optimizer steps that reach the final target."""
+
+    if not math.isfinite(final_target_rms) or final_target_rms <= 0:
+        raise ValueError("final_target_rms must be a finite value greater than 0")
+    one_step_rms = predict_loglinear_final_rms(
+        1,
+        dataset_batches_per_epoch,
+        gradient_accumulation_steps,
+        reference_rms,
+    )
+    steps = (final_target_rms / one_step_rms) ** (1.0 / LOGLINEAR_STEPS_EXPONENT)
+    return max(1, math.floor(steps + 0.5))
+
+
+def estimate_loglinear_training_plan(
+    original_steps: int,
+    final_target_rms: float,
+    reference_rms: float,
+    dataset_batches_per_epoch: int,
+    current_gradient_accumulation_steps: int,
+    probe_gradient_accumulation_steps: int,
+    target_microbatches: int | None,
+    minimum_gradient_accumulation_steps: int = 1,
+    gradient_accumulation_rounding_bias: float = 0.6,
+    adjusted_steps_divisible_by: int | None = None,
+) -> Tuple[int, float, int, int, int, Dict[str, float]]:
+    """Select a stable loglinear_v1 step and gradient-accumulation plan.
+
+    ``reference_rms`` is the step-500 rank-36 reference measured at the probe's
+    gradient accumulation. It is moved to each candidate production
+    accumulation with the calibrated rank-36 elasticity before solving.
+    """
+
+    if original_steps <= 0:
+        raise ValueError("original_steps must be greater than 0")
+    if probe_gradient_accumulation_steps <= 0:
+        raise ValueError("probe gradient accumulation must be greater than 0")
+    model_gradient_accumulation_steps = choose_gradient_accumulation_steps(
+        original_steps,
+        target_microbatches,
+        current_gradient_accumulation_steps,
+        minimum_gradient_accumulation_steps,
+        gradient_accumulation_rounding_bias,
+        dataset_batches_per_epoch,
+    )
+    seen_gradient_accumulations = set()
+    while model_gradient_accumulation_steps not in seen_gradient_accumulations:
+        seen_gradient_accumulations.add(model_gradient_accumulation_steps)
+        accumulation_ratio = (
+            model_gradient_accumulation_steps / probe_gradient_accumulation_steps
+        )
+        production_reference_rms = reference_rms * (
+            accumulation_ratio ** PROBE_RMS_GRADIENT_ACCUMULATION_ELASTICITY
+        )
+        estimated_steps = estimate_loglinear_steps(
+            final_target_rms,
+            dataset_batches_per_epoch,
+            model_gradient_accumulation_steps,
+            production_reference_rms,
+        )
+        adjusted_steps = round_steps_to_nearest_multiple(
+            estimated_steps,
+            adjusted_steps_divisible_by,
+        )
+        uncapped_adjusted_gradient_accumulation_steps = (
+            choose_gradient_accumulation_steps(
+                adjusted_steps,
+                target_microbatches,
+                current_gradient_accumulation_steps,
+                minimum_gradient_accumulation_steps,
+                gradient_accumulation_rounding_bias,
+            )
+        )
+        adjusted_gradient_accumulation_steps = choose_gradient_accumulation_steps(
+            adjusted_steps,
+            target_microbatches,
+            current_gradient_accumulation_steps,
+            minimum_gradient_accumulation_steps,
+            gradient_accumulation_rounding_bias,
+            dataset_batches_per_epoch,
+        )
+        if adjusted_gradient_accumulation_steps == model_gradient_accumulation_steps:
+            return (
+                estimated_steps,
+                estimated_steps / original_steps,
+                adjusted_steps,
+                uncapped_adjusted_gradient_accumulation_steps,
+                adjusted_gradient_accumulation_steps,
+                {
+                    "model": "loglinear_v1",
+                    "final_target_rms": final_target_rms,
+                    "probe_gradient_accumulation_steps": float(
+                        probe_gradient_accumulation_steps
+                    ),
+                    "production_gradient_accumulation_steps": float(
+                        adjusted_gradient_accumulation_steps
+                    ),
+                    "observed_probe_rms_at_probe_accumulation": reference_rms,
+                    "production_reference_rms": production_reference_rms,
+                    "optimizer_updates_per_epoch_nominal": (
+                        dataset_batches_per_epoch
+                        / adjusted_gradient_accumulation_steps
+                    ),
+                    "predicted_final_rms_at_estimated_steps": (
+                        predict_loglinear_final_rms(
+                            estimated_steps,
+                            dataset_batches_per_epoch,
+                            adjusted_gradient_accumulation_steps,
+                            production_reference_rms,
+                        )
+                    ),
+                    "predicted_final_rms_at_adjusted_steps": (
+                        predict_loglinear_final_rms(
+                            adjusted_steps,
+                            dataset_batches_per_epoch,
+                            adjusted_gradient_accumulation_steps,
+                            production_reference_rms,
+                        )
+                    ),
+                },
+            )
+        model_gradient_accumulation_steps = adjusted_gradient_accumulation_steps
+
+    raise ValueError(
+        "RMS probe could not find a stable step and gradient-accumulation "
+        "combination for loglinear_v1"
     )
 
 

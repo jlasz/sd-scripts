@@ -44,6 +44,7 @@ import library.lora_squeeze_training as lora_squeeze_training
 import library.rms_utils as rms_utils
 from library.rms_step_probe import (
     CALIBRATION_PROBE_STEPS,
+    LOGLINEAR_POLICY,
     PIECEWISE_ENERGY_POLICY,
     build_rms_probe_args,
     choose_adjusted_probe_training_steps,
@@ -52,6 +53,7 @@ from library.rms_step_probe import (
     combine_observed_squeeze_retentions,
     count_optimizer_step_microbatches,
     epoch_accumulation_group_sizes,
+    estimate_loglinear_training_plan,
     estimate_piecewise_training_plan,
     estimate_rms_adjusted_steps,
     fit_adjusted_probe_rank36_transfer,
@@ -1109,6 +1111,49 @@ class NetworkTrainer:
                     }.items()
                 }
             )
+        elif original_args.rms_probe_scaling_policy == LOGLINEAR_POLICY:
+            (
+                model_reference_rms,
+                _,
+                initial_probe_fit_details,
+            ) = fit_schedule_aware_probe_energy_model(
+                probe_result["rms_curve"],
+                original_steps,
+                CALIBRATION_PROBE_STEPS,
+                original_args.rms_probe_curve_every_n_steps,
+            )
+            (
+                estimated_steps,
+                step_multiplier,
+                adjusted_steps,
+                uncapped_adjusted_gradient_accumulation_steps,
+                adjusted_gradient_accumulation_steps,
+                model_details,
+            ) = estimate_loglinear_training_plan(
+                original_steps=original_steps,
+                final_target_rms=original_args.rms_probe_final_target,
+                reference_rms=model_reference_rms,
+                dataset_batches_per_epoch=probe_result["dataset_batches_per_epoch"],
+                current_gradient_accumulation_steps=(
+                    original_args.gradient_accumulation_steps
+                ),
+                probe_gradient_accumulation_steps=(
+                    probe_args.gradient_accumulation_steps
+                ),
+                target_microbatches=(
+                    original_args.rms_probe_gradient_accumulation_target_microbatches
+                ),
+                minimum_gradient_accumulation_steps=(
+                    original_args.rms_probe_min_gradient_accumulation_steps
+                ),
+                gradient_accumulation_rounding_bias=(
+                    original_args.rms_probe_gradient_accumulation_rounding_bias
+                ),
+                adjusted_steps_divisible_by=(
+                    original_args.rms_probe_adjusted_steps_divisible_by
+                ),
+            )
+            model_details.update(initial_probe_fit_details)
         else:
             estimated_steps, step_multiplier = estimate_rms_adjusted_steps(
                 original_steps,
@@ -2907,18 +2952,20 @@ def setup_parser() -> argparse.ArgumentParser:
         "--rms_probe_scaling_policy",
         type=str,
         default="linear",
-        choices=["linear", "piecewise_energy_v1"],
+        choices=["linear", "piecewise_energy_v1", "loglinear_v1"],
         help=(
             "step estimation policy: linear preserves the original target/observed scaling; "
             "piecewise_energy_v1 uses calibrated rank-36 RMS-squared growth and "
-            "compressed-stage normalized RMS velocity for Anima 36->9"
+            "compressed-stage normalized RMS velocity for Anima 36->9; "
+            "loglinear_v1 uses one log-linear fit of the final RMS on steps, "
+            "optimizer steps per epoch, and the step-500 probe RMS for Anima 36->9"
         ),
     )
     parser.add_argument(
         "--rms_probe_final_target",
         type=float,
         default=None,
-        help="desired final total scaled LoRA RMS; required by piecewise_energy_v1",
+        help="desired final total scaled LoRA RMS; required by piecewise_energy_v1 and loglinear_v1",
     )
     parser.add_argument(
         "--rms_probe_steps",

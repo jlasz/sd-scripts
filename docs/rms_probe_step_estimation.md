@@ -160,3 +160,22 @@ Limitations:
 - The feature cannot be combined with `resume`, `initial_step`, `initial_epoch`, or DeepSpeed.
 - Both probe settings must be provided together.
 - `piecewise_energy_v1` requires enough pre-squeeze curve samples to fit rank-36 energy, a positive final RMS target, and the calibrated 36-to-9 four-squeeze schedule. Probe 1 may cross squeeze boundaries; each post-squeeze segment still needs at least two usable interior samples to replace the regression with an observed velocity. Probe horizons other than 500 extrapolate their fitted rank-36 energy line to the step-500 calibration reference.
+
+## `loglinear_v1` policy
+
+`rms_probe_scaling_policy = "loglinear_v1"` is a simpler alternative to `piecewise_energy_v1` for the same Anima 36->9 four-squeeze schedule with equal segments. It runs the same isolated Probe 1 and uses the same options (`rms_probe_final_target`, the microbatch budget, and step rounding), but it has no stage model, no squeeze-retention table, and never runs Probe 2. The production plan stays fixed before training starts.
+
+The final RMS is one log-linear fit:
+
+```
+log(final_rms) = -10.3176
+                 + 0.7835 * log(total optimizer steps)
+                 - 0.2386 * log(batches per epoch / gradient accumulation)
+                 + 0.4814 * log(step-500 rank-36 reference RMS)
+```
+
+The reference RMS is the same schedule-aware step-500 value that `piecewise_energy_v1` uses, moved to the production gradient accumulation with the rank-36 elasticity. The step count is the closed-form inverse of this equation, iterated with the gradient-accumulation choice until both agree.
+
+The constants are fitted by `tools/refit_rms_probe_loglinear.py` on thirty-seven completed trajectories: the thirty-three piecewise calibration rows, the third 001 revision, and three Ahsoka runs. Endpoint MAPE is `1.84%` in-sample and `2.37%` leave-one-family-out (maximum `6.94%`). Fitted on the thirty-three piecewise rows only, it predicts the four later runs within `+3.4%`, `-1.9%`, `-0.6%`, and `-2.1%`; model 2.9 misses the same four by `+5.5%`, `-5.9%`, `-2.6%`, and `-5.8%`. Adding the rank-36 energy slope as a fifth term does not improve the held-out error, so it is not used.
+
+To add a completed run, append its row to `EXTRA_ROWS` in the tool, run it, and copy the four printed constants into `library/rms_step_probe.py`.

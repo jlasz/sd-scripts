@@ -18,6 +18,8 @@ from library.rms_step_probe import (
     equal_squeeze_steps,
     epoch_accumulation_group_sizes,
     estimate_augmented_later_mean_rms_velocity,
+    estimate_loglinear_steps,
+    estimate_loglinear_training_plan,
     estimate_piecewise_energy_adjusted_steps,
     estimate_piecewise_training_plan,
     estimate_rms_adjusted_steps,
@@ -28,6 +30,7 @@ from library.rms_step_probe import (
     fit_schedule_aware_probe_energy_model,
     optimizer_steps_for_microbatch_budget,
     probe_schedule_needs_adjusted_probe,
+    predict_loglinear_final_rms,
     predict_piecewise_energy_final_rms,
     rescale_observed_later_mean_rms_velocity,
     rescale_probe_measurements_for_gradient_accumulation,
@@ -2049,6 +2052,131 @@ class RMSStepProbeTest(unittest.TestCase):
 
         self.assertEqual(probe_args.max_train_steps, 400)
         self.assertEqual(probe_args._training_step_limit, 180)
+
+
+class LoglinearPolicyTest(unittest.TestCase):
+    # (batches per epoch, GA, step-500 reference RMS, steps, final RMS) of
+    # completed Anima 36->9 runs: Rosine_fourth, Izutsumi final, Marcia_second,
+    # Ahsoka_second, and the third 001 revision.
+    COMPLETED_RUNS = (
+        (110, 6, 4.176764188992321e-5, 4000, 8.552275888033521e-5),
+        (262, 4, 3.417661355342716e-5, 6400, 8.171637791552906e-5),
+        (22, 5, 5.0705232640351776e-5, 2400, 8.776551913866043e-5),
+        (243, 4, 3.3271486e-5, 6400, 8.351577e-5),
+        (109, 6, 3.9533202e-5, 4600, 9.0057752e-5),
+    )
+
+    def test_prediction_matches_completed_runs_within_five_percent(self):
+        for batches, accumulation, reference, steps, final in self.COMPLETED_RUNS:
+            predicted = predict_loglinear_final_rms(steps, batches, accumulation, reference)
+            self.assertLess(abs(predicted / final - 1.0), 0.05)
+
+    def test_step_solver_inverts_the_prediction(self):
+        for batches, accumulation, reference, steps, _ in self.COMPLETED_RUNS:
+            target = predict_loglinear_final_rms(steps, batches, accumulation, reference)
+            self.assertEqual(
+                estimate_loglinear_steps(target, batches, accumulation, reference),
+                steps,
+            )
+
+    def test_more_steps_and_fewer_steps_per_epoch_raise_the_final_rms(self):
+        base = predict_loglinear_final_rms(4000, 120, 6, 4e-5)
+        self.assertGreater(predict_loglinear_final_rms(5000, 120, 6, 4e-5), base)
+        self.assertGreater(predict_loglinear_final_rms(4000, 120, 12, 4e-5), base)
+        self.assertGreater(predict_loglinear_final_rms(4000, 60, 6, 4e-5), base)
+        self.assertGreater(predict_loglinear_final_rms(4000, 120, 6, 4.4e-5), base)
+
+    def test_plan_without_compute_budget_keeps_gradient_accumulation(self):
+        estimated, multiplier, adjusted, uncapped, accumulation, details = (
+            estimate_loglinear_training_plan(
+                original_steps=4000,
+                final_target_rms=8.4e-5,
+                reference_rms=3.3271486e-5,
+                dataset_batches_per_epoch=243,
+                current_gradient_accumulation_steps=4,
+                probe_gradient_accumulation_steps=4,
+                target_microbatches=None,
+                adjusted_steps_divisible_by=100,
+            )
+        )
+        self.assertEqual(accumulation, 4)
+        self.assertEqual(uncapped, 4)
+        self.assertEqual(adjusted % 100, 0)
+        self.assertLessEqual(abs(adjusted - estimated), 50)
+        self.assertAlmostEqual(multiplier, estimated / 4000)
+        self.assertAlmostEqual(details["production_reference_rms"], 3.3271486e-5)
+        self.assertLess(
+            abs(details["predicted_final_rms_at_estimated_steps"] / 8.4e-5 - 1.0),
+            0.001,
+        )
+        # the completed run took 6,400 steps to 8.35e-5
+        self.assertLess(abs(adjusted / 6400 - 1.0), 0.1)
+
+    def test_plan_with_compute_budget_converges_and_rescales_the_reference(self):
+        estimated, _, adjusted, _, accumulation, details = estimate_loglinear_training_plan(
+            original_steps=4000,
+            final_target_rms=8.425384599385171e-5,
+            reference_rms=3.3400877e-5,
+            dataset_batches_per_epoch=258,
+            current_gradient_accumulation_steps=6,
+            probe_gradient_accumulation_steps=6,
+            target_microbatches=24000,
+            gradient_accumulation_rounding_bias=0.7,
+            adjusted_steps_divisible_by=100,
+        )
+        self.assertEqual(
+            accumulation,
+            choose_gradient_accumulation_steps(adjusted, 24000, 6, 1, 0.7, 258),
+        )
+        expected_reference = 3.3400877e-5 * (accumulation / 6) ** 0.13407367061621528
+        self.assertAlmostEqual(details["production_reference_rms"], expected_reference)
+        self.assertLess(
+            abs(
+                predict_loglinear_final_rms(estimated, 258, accumulation, expected_reference)
+                / 8.425384599385171e-5
+                - 1.0
+            ),
+            0.001,
+        )
+
+    def test_validation_accepts_loglinear_and_requires_final_target(self):
+        self.assertTrue(
+            validate_rms_probe_configuration(
+                make_args(rms_probe_scaling_policy="loglinear_v1", rms_probe_final_target=8e-5)
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "rms_probe_final_target"):
+            validate_rms_probe_configuration(make_args(rms_probe_scaling_policy="loglinear_v1"))
+
+    def test_validation_rejects_unsupported_loglinear_settings(self):
+        with self.assertRaisesRegex(ValueError, "equal squeeze segments"):
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_scaling_policy="loglinear_v1",
+                    rms_probe_final_target=8e-5,
+                    lora_squeeze_final_segment_ratio=1.5,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "force_adjusted_probe"):
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_scaling_policy="loglinear_v1",
+                    rms_probe_final_target=8e-5,
+                    rms_probe_force_adjusted_probe=True,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "36->9"):
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_scaling_policy="loglinear_v1",
+                    rms_probe_final_target=8e-5,
+                    lora_squeeze_num_squeezes=2,
+                )
+            )
+
+    def test_loglinear_never_requests_an_adjusted_probe(self):
+        self.assertFalse(should_run_adjusted_probe("loglinear_v1", 1500, 500))
+
 
 if __name__ == "__main__":
     unittest.main()
