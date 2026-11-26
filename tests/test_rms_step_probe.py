@@ -18,6 +18,8 @@ from library.rms_step_probe import (
     equal_squeeze_steps,
     epoch_accumulation_group_sizes,
     estimate_augmented_later_mean_rms_velocity,
+    estimate_formula_steps,
+    estimate_formula_training_plan,
     estimate_loglinear_steps,
     estimate_loglinear_training_plan,
     estimate_piecewise_energy_adjusted_steps,
@@ -30,6 +32,7 @@ from library.rms_step_probe import (
     fit_schedule_aware_probe_energy_model,
     optimizer_steps_for_microbatch_budget,
     probe_schedule_needs_adjusted_probe,
+    predict_formula_final_rms,
     predict_loglinear_final_rms,
     predict_piecewise_energy_final_rms,
     rescale_observed_later_mean_rms_velocity,
@@ -2176,6 +2179,104 @@ class LoglinearPolicyTest(unittest.TestCase):
 
     def test_loglinear_never_requests_an_adjusted_probe(self):
         self.assertFalse(should_run_adjusted_probe("loglinear_v1", 1500, 500))
+
+
+class FormulaPolicyTest(unittest.TestCase):
+    def test_prediction_matches_completed_runs_within_six_percent(self):
+        for batches, accumulation, _, steps, final in LoglinearPolicyTest.COMPLETED_RUNS:
+            predicted = predict_formula_final_rms(steps, batches, accumulation)
+            self.assertLess(abs(predicted / final - 1.0), 0.06)
+
+    def test_step_solver_inverts_the_prediction(self):
+        for batches, accumulation, _, steps, _ in LoglinearPolicyTest.COMPLETED_RUNS:
+            target = predict_formula_final_rms(steps, batches, accumulation)
+            self.assertEqual(estimate_formula_steps(target, batches, accumulation), steps)
+
+    def test_plan_without_budget_keeps_gradient_accumulation(self):
+        estimated, adjusted, accumulation, details = estimate_formula_training_plan(
+            final_target_rms=8.425384599385171e-5,
+            dataset_batches_per_epoch=210,
+            current_gradient_accumulation_steps=4,
+            target_microbatches=None,
+            adjusted_steps_divisible_by=100,
+        )
+        self.assertEqual(accumulation, 4)
+        self.assertEqual(adjusted, 6100)
+        self.assertLessEqual(abs(adjusted - estimated), 50)
+        self.assertLess(
+            abs(details["predicted_final_rms_at_adjusted_steps"] / 8.425384599385171e-5 - 1.0),
+            0.01,
+        )
+
+    def test_plan_with_budget_is_self_consistent(self):
+        for batches, current in ((258, 6), (22, 5), (110, 6), (15, 4), (650, 6)):
+            _, adjusted, accumulation, details = estimate_formula_training_plan(
+                final_target_rms=8.425384599385171e-5,
+                dataset_batches_per_epoch=batches,
+                current_gradient_accumulation_steps=current,
+                target_microbatches=24000,
+                gradient_accumulation_rounding_bias=0.7,
+                adjusted_steps_divisible_by=100,
+            )
+            self.assertGreaterEqual(accumulation, 1)
+            self.assertLessEqual(accumulation, batches)
+            self.assertEqual(adjusted % 100, 0)
+            self.assertLess(
+                abs(details["predicted_final_rms_at_adjusted_steps"] / 8.425384599385171e-5 - 1.0),
+                0.03,
+            )
+
+    def test_plan_is_deterministic_for_resume(self):
+        arguments = dict(
+            final_target_rms=8e-5,
+            dataset_batches_per_epoch=243,
+            current_gradient_accumulation_steps=6,
+            target_microbatches=24000,
+            gradient_accumulation_rounding_bias=0.7,
+            adjusted_steps_divisible_by=100,
+        )
+        self.assertEqual(
+            estimate_formula_training_plan(**arguments)[:3],
+            estimate_formula_training_plan(**arguments)[:3],
+        )
+
+    def test_validation_needs_no_probe_settings_and_requests_no_probe_run(self):
+        self.assertFalse(
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_scaling_policy="formula_v1",
+                    rms_probe_final_target=8e-5,
+                    rms_probe_target=None,
+                    rms_probe_steps=None,
+                )
+            )
+        )
+        # leftover probe settings are ignored rather than starting a probe
+        self.assertFalse(
+            validate_rms_probe_configuration(
+                make_args(rms_probe_scaling_policy="formula_v1", rms_probe_final_target=8e-5)
+            )
+        )
+
+    def test_validation_rejects_unsupported_formula_settings(self):
+        with self.assertRaisesRegex(ValueError, "rms_probe_final_target"):
+            validate_rms_probe_configuration(make_args(rms_probe_scaling_policy="formula_v1"))
+        with self.assertRaisesRegex(ValueError, "36->9"):
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_scaling_policy="formula_v1",
+                    rms_probe_final_target=8e-5,
+                    lora_squeeze_start_dim=41,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "max_train_epochs"):
+            validate_rms_probe_configuration(
+                make_args(
+                    rms_probe_scaling_policy="formula_v1",
+                    rms_probe_final_target=8e-5,
+                    max_train_epochs=10,
+                )
+            )
 
 
 if __name__ == "__main__":

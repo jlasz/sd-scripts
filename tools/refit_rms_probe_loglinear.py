@@ -1,4 +1,4 @@
-"""Reproduce the loglinear_v1 RMS-probe constants.
+"""Reproduce the loglinear_v1 and formula_v1 RMS-probe constants.
 
 Offline maintenance tool. It reuses the reviewed calibration table of
 refit_rms_probe_calibration.py and adds the completed runs that are not part of
@@ -8,6 +8,8 @@ the piecewise calibration. The model is one unweighted least-squares fit:
                      + a * log(total_steps)
                      + b * log(batches_per_epoch / gradient_accumulation)
                      + c * log(reference_rms)
+
+formula_v1 is the same fit without the reference_rms term (no probe run).
 
 To add a run, append a CalibrationRow to EXTRA_ROWS and run this file; copy the
 printed constants into library/rms_step_probe.py.
@@ -36,7 +38,23 @@ EXTRA_ROWS = (
 ROWS = tuple(PIECEWISE_ROWS) + EXTRA_ROWS
 
 
+USE_PROBE = True
+
+
 def features(rows: tuple[CalibrationRow, ...]) -> np.ndarray:
+    if not USE_PROBE:
+        # formula_v1: no probe term
+        return np.asarray(
+            [
+                (
+                    1.0,
+                    math.log(row.total_steps),
+                    math.log(row.batches_per_epoch / row.production_ga),
+                )
+                for row in rows
+            ],
+            dtype=np.float64,
+        )
     return np.asarray(
         [
             (
@@ -72,13 +90,10 @@ def leave_one_family_out(rows: tuple[CalibrationRow, ...] = ROWS) -> np.ndarray:
     return np.asarray(errors)
 
 
-def main() -> None:
+def report(prefix: str, names: tuple[str, ...]) -> None:
     coefficients = refit()
-    print("rows:", len(ROWS))
-    print("LOGLINEAR_INTERCEPT =", repr(float(coefficients[0])))
-    print("LOGLINEAR_STEPS_EXPONENT =", repr(float(coefficients[1])))
-    print("LOGLINEAR_STEPS_PER_EPOCH_EXPONENT =", repr(float(coefficients[2])))
-    print("LOGLINEAR_REFERENCE_RMS_EXPONENT =", repr(float(coefficients[3])))
+    for name, value in zip(names, coefficients):
+        print(f"{prefix}_{name} =", repr(float(value)))
     in_sample = np.abs(relative_errors(coefficients, ROWS))
     print(f"in-sample endpoint MAPE: {in_sample.mean() * 100:.3f}% (max {in_sample.max() * 100:.3f}%)")
     held_out = np.abs(leave_one_family_out())
@@ -91,6 +106,20 @@ def main() -> None:
         "fit on the piecewise table only, endpoint error on EXTRA_ROWS:",
         ", ".join(f"{error * 100:+.2f}%" for error in unseen),
     )
+
+
+def main() -> None:
+    global USE_PROBE
+    print("rows:", len(ROWS))
+    USE_PROBE = True
+    report(
+        "LOGLINEAR",
+        ("INTERCEPT", "STEPS_EXPONENT", "STEPS_PER_EPOCH_EXPONENT", "REFERENCE_RMS_EXPONENT"),
+    )
+    print()
+    USE_PROBE = False
+    report("FORMULA", ("INTERCEPT", "STEPS_EXPONENT", "STEPS_PER_EPOCH_EXPONENT"))
+    USE_PROBE = True
 
 
 if __name__ == "__main__":

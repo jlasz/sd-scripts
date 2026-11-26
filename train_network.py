@@ -44,6 +44,7 @@ import library.lora_squeeze_training as lora_squeeze_training
 import library.rms_utils as rms_utils
 from library.rms_step_probe import (
     CALIBRATION_PROBE_STEPS,
+    FORMULA_POLICY,
     LOGLINEAR_POLICY,
     PIECEWISE_ENERGY_POLICY,
     build_rms_probe_args,
@@ -53,6 +54,7 @@ from library.rms_step_probe import (
     combine_observed_squeeze_retentions,
     count_optimizer_step_microbatches,
     epoch_accumulation_group_sizes,
+    estimate_formula_training_plan,
     estimate_loglinear_training_plan,
     estimate_piecewise_training_plan,
     estimate_rms_adjusted_steps,
@@ -1817,6 +1819,47 @@ class NetworkTrainer:
             )
             return
 
+        if args.rms_probe_scaling_policy == FORMULA_POLICY:
+            # No probe run: choose steps and gradient accumulation from the dataset size before
+            # the accelerator, the squeeze schedule and the LR scheduler are built. The result
+            # depends only on the config and the dataset, so a resumed run gets the same plan.
+            formula_original_steps = args.max_train_steps
+            formula_original_accumulation = args.gradient_accumulation_steps
+            (
+                formula_estimated_steps,
+                formula_adjusted_steps,
+                formula_accumulation,
+                formula_details,
+            ) = estimate_formula_training_plan(
+                final_target_rms=args.rms_probe_final_target,
+                dataset_batches_per_epoch=len(train_dataset_group),
+                current_gradient_accumulation_steps=formula_original_accumulation,
+                target_microbatches=args.rms_probe_gradient_accumulation_target_microbatches,
+                minimum_gradient_accumulation_steps=args.rms_probe_min_gradient_accumulation_steps,
+                gradient_accumulation_rounding_bias=args.rms_probe_gradient_accumulation_rounding_bias,
+                adjusted_steps_divisible_by=args.rms_probe_adjusted_steps_divisible_by,
+            )
+            args.max_train_steps = formula_adjusted_steps
+            args.gradient_accumulation_steps = formula_accumulation
+            training_step_limit = formula_adjusted_steps
+            args._rms_probe_original_max_train_steps = formula_original_steps
+            args._rms_probe_estimated_max_train_steps = formula_estimated_steps
+            args._rms_probe_step_multiplier = formula_estimated_steps / formula_original_steps
+            args._rms_probe_dataset_batches_per_epoch = len(train_dataset_group)
+            args._rms_probe_original_gradient_accumulation_steps = formula_original_accumulation
+            logger.info(
+                "formula_v1 plan: %s batches per epoch, final_target=%.8g -> max_train_steps %s -> %s "
+                "(estimated %s), gradient accumulation %s -> %s, predicted final RMS %.8g",
+                len(train_dataset_group),
+                args.rms_probe_final_target,
+                formula_original_steps,
+                formula_adjusted_steps,
+                formula_estimated_steps,
+                formula_original_accumulation,
+                formula_accumulation,
+                formula_details["predicted_final_rms_at_adjusted_steps"],
+            )
+
         if cache_latents:
             assert (
                 train_dataset_group.is_latent_cacheable()
@@ -2952,20 +2995,22 @@ def setup_parser() -> argparse.ArgumentParser:
         "--rms_probe_scaling_policy",
         type=str,
         default="linear",
-        choices=["linear", "piecewise_energy_v1", "loglinear_v1"],
+        choices=["linear", "piecewise_energy_v1", "loglinear_v1", "formula_v1"],
         help=(
             "step estimation policy: linear preserves the original target/observed scaling; "
             "piecewise_energy_v1 uses calibrated rank-36 RMS-squared growth and "
             "compressed-stage normalized RMS velocity for Anima 36->9; "
             "loglinear_v1 uses one log-linear fit of the final RMS on steps, "
-            "optimizer steps per epoch, and the step-500 probe RMS for Anima 36->9"
+            "optimizer steps per epoch, and the step-500 probe RMS for Anima 36->9; "
+            "formula_v1 runs no probe and picks steps and gradient accumulation from "
+            "--rms_probe_final_target and the dataset size alone for Anima 36->9"
         ),
     )
     parser.add_argument(
         "--rms_probe_final_target",
         type=float,
         default=None,
-        help="desired final total scaled LoRA RMS; required by piecewise_energy_v1 and loglinear_v1",
+        help="desired final total scaled LoRA RMS; required by piecewise_energy_v1, loglinear_v1 and formula_v1",
     )
     parser.add_argument(
         "--rms_probe_steps",

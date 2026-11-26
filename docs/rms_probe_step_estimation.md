@@ -179,3 +179,27 @@ The reference RMS is the same schedule-aware step-500 value that `piecewise_ener
 The constants are fitted by `tools/refit_rms_probe_loglinear.py` on thirty-seven completed trajectories: the thirty-three piecewise calibration rows, the third 001 revision, and three Ahsoka runs. Endpoint MAPE is `1.84%` in-sample and `2.37%` leave-one-family-out (maximum `6.94%`). Fitted on the thirty-three piecewise rows only, it predicts the four later runs within `+3.4%`, `-1.9%`, `-0.6%`, and `-2.1%`; model 2.9 misses the same four by `+5.5%`, `-5.9%`, `-2.6%`, and `-5.8%`. Adding the rank-36 energy slope as a fifth term does not improve the held-out error, so it is not used.
 
 To add a completed run, append its row to `EXTRA_ROWS` in the tool, run it, and copy the four printed constants into `library/rms_step_probe.py`.
+
+## `formula_v1` policy (no probe run)
+
+`rms_probe_scaling_policy = "formula_v1"` picks `max_train_steps` and, when a microbatch budget is set, `gradient_accumulation_steps` from the dataset size alone. No probe run is started. Only `rms_probe_final_target` is required; `rms_probe_target` and `rms_probe_steps` are ignored if present.
+
+```toml
+rms_probe_scaling_policy = "formula_v1"
+rms_probe_final_target = 0.00008425384599385171
+rms_probe_adjusted_steps_divisible_by = 100
+# optional: also choose gradient accumulation for a compute budget
+rms_probe_gradient_accumulation_target_microbatches = 24000
+rms_probe_gradient_accumulation_rounding_bias = 0.7
+```
+
+```
+log(final_rms) = -14.8529
+                 + 0.7717 * log(total optimizer steps)
+                 - 0.3174 * log(batches per epoch / gradient accumulation)
+```
+
+Without `rms_probe_gradient_accumulation_target_microbatches`, the configured gradient accumulation is kept and only the steps are solved. The plan is computed once, after the dataset is loaded and before the squeeze schedule is built, and is written to the log as `formula_v1 plan: ...`. Because it depends only on the config and the dataset, a resumed run computes the same plan. The configured `max_train_steps` is replaced.
+
+On the same thirty-seven trajectories, endpoint MAPE is `3.39%` leave-one-family-out (maximum `9.25%`), against `2.37%` for `loglinear_v1`. The calibration covers gradient accumulation 2 through 14 and 15 through 262 batches per epoch; plans outside that range are extrapolations.
+

@@ -8,7 +8,8 @@ from typing import Dict, Sequence, Tuple
 LINEAR_POLICY = "linear"
 PIECEWISE_ENERGY_POLICY = "piecewise_energy_v1"
 LOGLINEAR_POLICY = "loglinear_v1"
-SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY, LOGLINEAR_POLICY)
+FORMULA_POLICY = "formula_v1"
+SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY, LOGLINEAR_POLICY, FORMULA_POLICY)
 # Policies that predict the final RMS of the Anima 36->9 four-squeeze schedule
 # from the rank-36 probe and therefore need --rms_probe_final_target.
 FINAL_TARGET_POLICIES = (PIECEWISE_ENERGY_POLICY, LOGLINEAR_POLICY)
@@ -87,8 +88,40 @@ LOGLINEAR_STEPS_EXPONENT = 0.7835062456574756
 LOGLINEAR_STEPS_PER_EPOCH_EXPONENT = -0.23862292006208405
 LOGLINEAR_REFERENCE_RMS_EXPONENT = 0.48139220669062843
 
+# formula_v1: the same fit without the probe term, so no probe run is needed.
+#   log(final_rms) = intercept
+#                    + steps_exponent * log(total optimizer steps)
+#                    + steps_per_epoch_exponent * log(batches per epoch / gradient accumulation)
+# Same thirty-seven trajectories; leave-one-family-out endpoint MAPE is 3.4%.
+FORMULA_INTERCEPT = -14.852914971886761
+FORMULA_STEPS_EXPONENT = 0.7716783900180015
+FORMULA_STEPS_PER_EPOCH_EXPONENT = -0.3173642952080637
+
+
+def _validate_anima_36_to_9_schedule(args: argparse.Namespace, policy: str):
+    expected = {
+        "lora_squeeze_start_dim": 36,
+        "network_dim": 9,
+        "lora_squeeze_num_squeezes": 4,
+        "lora_squeeze_train_after_final_squeeze": True,
+        "lora_squeeze_step_schedule": "equal",
+        "lora_squeeze_rank_schedule": "geometric",
+    }
+    mismatches = [
+        f"{name}={getattr(args, name, None)!r} (expected {value!r})"
+        for name, value in expected.items()
+        if getattr(args, name, None) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            f"{policy} is calibrated for the Anima 36->9 four-squeeze schedule: "
+            + ", ".join(mismatches)
+        )
+
 
 def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
+    """Validate the probe options. Returns whether an isolated probe run is needed."""
+
     target = args.rms_probe_target
     steps = args.rms_probe_steps
     step_multiple = args.rms_probe_adjusted_steps_divisible_by
@@ -110,6 +143,35 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
 
     if policy not in SCALING_POLICIES:
         raise ValueError("--rms_probe_scaling_policy must be one of: " + ", ".join(SCALING_POLICIES))
+
+    if policy == FORMULA_POLICY:
+        # No probe run: the plan is computed from the dataset size alone.
+        if final_target is None or not math.isfinite(final_target) or final_target <= 0:
+            raise ValueError(
+                "--rms_probe_final_target must be a finite value greater than 0 for formula_v1"
+            )
+        if force_adjusted_probe:
+            raise ValueError("--rms_probe_force_adjusted_probe is not used by formula_v1")
+        if args.max_train_epochs is not None:
+            raise ValueError("formula_v1 step estimation requires --max_train_steps, not --max_train_epochs")
+        if args.deepspeed:
+            raise ValueError("formula_v1 step estimation does not support --deepspeed")
+        if step_multiple is not None and step_multiple <= 0:
+            raise ValueError("--rms_probe_adjusted_steps_divisible_by must be greater than 0")
+        if microbatch_target is not None and microbatch_target <= 0:
+            raise ValueError("--rms_probe_gradient_accumulation_target_microbatches must be greater than 0")
+        if minimum_gradient_accumulation <= 0:
+            raise ValueError("--rms_probe_min_gradient_accumulation_steps must be greater than 0")
+        if (
+            not math.isfinite(gradient_accumulation_rounding_bias)
+            or gradient_accumulation_rounding_bias < 0
+            or gradient_accumulation_rounding_bias > 1
+        ):
+            raise ValueError("--rms_probe_gradient_accumulation_rounding_bias must be between 0 and 1")
+        if first_segment_ratio != 1.0 or final_segment_ratio != 1.0:
+            raise ValueError("formula_v1 is calibrated for equal squeeze segments only")
+        _validate_anima_36_to_9_schedule(args, policy)
+        return False
 
     if target is None and steps is None:
         if step_multiple is not None:
@@ -185,24 +247,7 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
             raise ValueError(
                 f"--rms_probe_final_target must be a finite value greater than 0 for {policy}"
             )
-        expected = {
-            "lora_squeeze_start_dim": 36,
-            "network_dim": 9,
-            "lora_squeeze_num_squeezes": 4,
-            "lora_squeeze_train_after_final_squeeze": True,
-            "lora_squeeze_step_schedule": "equal",
-            "lora_squeeze_rank_schedule": "geometric",
-        }
-        mismatches = [
-            f"{name}={getattr(args, name, None)!r} (expected {value!r})"
-            for name, value in expected.items()
-            if getattr(args, name, None) != value
-        ]
-        if mismatches:
-            raise ValueError(
-                f"{policy} is calibrated for the Anima 36->9 four-squeeze schedule: "
-                + ", ".join(mismatches)
-            )
+        _validate_anima_36_to_9_schedule(args, policy)
         if policy == LOGLINEAR_POLICY:
             if first_segment_ratio != 1.0 or final_segment_ratio != 1.0:
                 raise ValueError("loglinear_v1 is calibrated for equal squeeze segments only")
@@ -1825,6 +1870,132 @@ def estimate_loglinear_training_plan(
     raise ValueError(
         "RMS probe could not find a stable step and gradient-accumulation "
         "combination for loglinear_v1"
+    )
+
+
+def predict_formula_final_rms(
+    total_steps: int,
+    dataset_batches_per_epoch: int,
+    gradient_accumulation_steps: int,
+) -> float:
+    """Final RMS of the 36->9 four-squeeze schedule under formula_v1 (no probe)."""
+
+    if total_steps <= 0 or dataset_batches_per_epoch <= 0 or gradient_accumulation_steps <= 0:
+        raise ValueError("steps, batches per epoch, and gradient accumulation must be greater than 0")
+    return math.exp(
+        FORMULA_INTERCEPT
+        + FORMULA_STEPS_EXPONENT * math.log(total_steps)
+        + FORMULA_STEPS_PER_EPOCH_EXPONENT
+        * math.log(dataset_batches_per_epoch / gradient_accumulation_steps)
+    )
+
+
+def estimate_formula_steps(
+    final_target_rms: float,
+    dataset_batches_per_epoch: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Invert formula_v1 for the optimizer steps that reach the final target."""
+
+    if not math.isfinite(final_target_rms) or final_target_rms <= 0:
+        raise ValueError("final_target_rms must be a finite value greater than 0")
+    one_step_rms = predict_formula_final_rms(
+        1,
+        dataset_batches_per_epoch,
+        gradient_accumulation_steps,
+    )
+    steps = (final_target_rms / one_step_rms) ** (1.0 / FORMULA_STEPS_EXPONENT)
+    return max(1, math.floor(steps + 0.5))
+
+
+def estimate_formula_training_plan(
+    final_target_rms: float,
+    dataset_batches_per_epoch: int,
+    current_gradient_accumulation_steps: int,
+    target_microbatches: int | None,
+    minimum_gradient_accumulation_steps: int = 1,
+    gradient_accumulation_rounding_bias: float = 0.6,
+    adjusted_steps_divisible_by: int | None = None,
+) -> Tuple[int, int, int, Dict[str, float]]:
+    """Select steps and gradient accumulation from the dataset size alone.
+
+    Returns (estimated_steps, adjusted_steps, gradient_accumulation_steps,
+    details). Without a microbatch budget the configured accumulation is kept
+    and only the steps are solved. With a budget, steps and accumulation are
+    iterated until they agree; if they alternate between two neighbouring
+    plans, the one whose predicted final RMS is closest to the target is used.
+    """
+
+    def plan_for(accumulation: int) -> Tuple[int, int, int]:
+        estimated = estimate_formula_steps(
+            final_target_rms,
+            dataset_batches_per_epoch,
+            accumulation,
+        )
+        adjusted = round_steps_to_nearest_multiple(estimated, adjusted_steps_divisible_by)
+        chosen = choose_gradient_accumulation_steps(
+            adjusted,
+            target_microbatches,
+            current_gradient_accumulation_steps,
+            minimum_gradient_accumulation_steps,
+            gradient_accumulation_rounding_bias,
+            dataset_batches_per_epoch,
+        )
+        return estimated, adjusted, chosen
+
+    accumulation = current_gradient_accumulation_steps
+    visited = []
+    while True:
+        estimated_steps, adjusted_steps, chosen = plan_for(accumulation)
+        if chosen == accumulation:
+            break
+        if chosen in visited:
+            # A cycle between accumulation values: pick the member closest to the target.
+            cycle = visited[visited.index(chosen):] + [accumulation]
+            accumulation = min(
+                cycle,
+                key=lambda candidate: (
+                    abs(
+                        math.log(
+                            predict_formula_final_rms(
+                                plan_for(candidate)[1],
+                                dataset_batches_per_epoch,
+                                candidate,
+                            )
+                            / final_target_rms
+                        )
+                    ),
+                    candidate,
+                ),
+            )
+            estimated_steps, adjusted_steps, _ = plan_for(accumulation)
+            break
+        visited.append(accumulation)
+        accumulation = chosen
+
+    return (
+        estimated_steps,
+        adjusted_steps,
+        accumulation,
+        {
+            "model": "formula_v1",
+            "final_target_rms": final_target_rms,
+            "dataset_batches_per_epoch": float(dataset_batches_per_epoch),
+            "production_gradient_accumulation_steps": float(accumulation),
+            "predicted_final_rms_at_adjusted_steps": predict_formula_final_rms(
+                adjusted_steps,
+                dataset_batches_per_epoch,
+                accumulation,
+            ),
+            "nominal_production_microbatches": float(adjusted_steps * accumulation),
+            "actual_production_microbatches": float(
+                count_optimizer_step_microbatches(
+                    adjusted_steps,
+                    dataset_batches_per_epoch,
+                    accumulation,
+                )
+            ),
+        },
     )
 
 
