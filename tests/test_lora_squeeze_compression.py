@@ -39,9 +39,30 @@ def test_compression_matches_direct_truncated_svd(kernel_size):
 
     assert torch.allclose(effective_delta(module), expected, rtol=2e-5, atol=2e-5)
     assert stats["retained_energy_mean"] == pytest.approx(float((s[:4] ** 2).sum() / (s**2).sum()))
+    assert stats["retained_energy_global"] == pytest.approx(stats["retained_energy_mean"])
     assert transfers == []
     assert module.lora_dim == 4
     assert module.alpha.dtype == torch.float32
+
+
+def test_global_retention_is_weighted_by_effective_product_energy():
+    torch.manual_seed(124)
+    first = FakeLoRAModule(7, 9, 6, 3.0)
+    second = FakeLoRAModule(7, 9, 6, 3.0)
+    nn.init.normal_(first.lora_down.weight)
+    nn.init.normal_(first.lora_up.weight)
+    nn.init.normal_(second.lora_down.weight)
+    nn.init.normal_(second.lora_up.weight)
+    second.lora_up.weight.data.mul_(10.0)
+    products = (effective_delta(first), effective_delta(second))
+    singular_values = tuple(torch.linalg.svdvals(product) for product in products)
+    expected = sum(float((values[:3] ** 2).sum()) for values in singular_values) / sum(
+        float((values**2).sum()) for values in singular_values
+    )
+
+    stats, _ = squeeze_lora_network(FakeMultiNetwork(first, second), 3, target_alpha=1.5)
+
+    assert stats["retained_energy_global"] == pytest.approx(expected, rel=1e-5)
 
 
 def test_repeated_squeeze_matches_direct_lower_rank_approximation():

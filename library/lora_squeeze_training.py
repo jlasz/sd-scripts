@@ -276,6 +276,7 @@ class LoRASqueezeRuntime:
                 "target_rank",
                 "retained_energy_min",
                 "retained_energy_mean",
+                "retained_energy_global",
                 "numerical_rank_min",
                 "numerical_rank_mean",
                 "rank_deficient_modules",
@@ -695,6 +696,7 @@ class LoRASqueezeTrainingController:
             f"LoRA-Squeeze at step {lora_squeeze_step}: rank {int(stats['source_rank'])} -> {target_dim}, "
             f"alpha={target_alpha:.8g}, retained_energy_min={stats['retained_energy_min']:.6f}, "
             f"retained_energy_mean={stats['retained_energy_mean']:.6f}, "
+            f"retained_energy_global={stats['retained_energy_global']:.6f}, "
             f"numerical_rank_min={int(stats['numerical_rank_min'])}"
         )
         revived_channels = int(stats.get("revived_rank_channels", 0))

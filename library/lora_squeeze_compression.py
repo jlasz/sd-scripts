@@ -282,6 +282,8 @@ def squeeze_lora_network(
     )
 
     retained_energies: List[float] = []
+    total_product_energy = 0.0
+    kept_product_energy = 0.0
     numerical_ranks: List[int] = []
     revived_rank_channels = 0
     rank_deficient_modules = 0
@@ -310,6 +312,8 @@ def squeeze_lora_network(
             kept = singular_values[:usable_dim].clamp_min(0)
             total_energy = torch.sum(singular_values * singular_values).item()
             kept_energy = torch.sum(kept * kept).item()
+            total_product_energy += total_energy
+            kept_product_energy += kept_energy
             retained_energies.append(1.0 if total_energy == 0.0 else kept_energy / total_energy)
             numerical_ranks.append(numerical_rank)
             revived_count = int(revived_rank_mask.sum().item())
@@ -352,6 +356,11 @@ def squeeze_lora_network(
             "target_rank": float(target_dim),
             "retained_energy_min": min(retained_energies),
             "retained_energy_mean": sum(retained_energies) / len(retained_energies),
+            "retained_energy_global": (
+                1.0
+                if total_product_energy == 0.0
+                else kept_product_energy / total_product_energy
+            ),
             "numerical_rank_min": float(min(numerical_ranks)),
             "numerical_rank_mean": float(sum(numerical_ranks) / len(numerical_ranks)),
             "rank_deficient_modules": float(rank_deficient_modules),

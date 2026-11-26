@@ -44,17 +44,25 @@ import library.lora_squeeze_training as lora_squeeze_training
 import library.rms_utils as rms_utils
 from library.rms_step_probe import (
     CALIBRATION_PROBE_STEPS,
+    FORMULA_POLICY,
+    LOGLINEAR_POLICY,
     PIECEWISE_ENERGY_POLICY,
     build_rms_probe_args,
     choose_adjusted_probe_training_steps,
     choose_gradient_accumulation_steps,
+    combine_observed_later_mean_rms_velocities,
+    combine_observed_squeeze_retentions,
     count_optimizer_step_microbatches,
     epoch_accumulation_group_sizes,
+    estimate_formula_training_plan,
+    estimate_loglinear_training_plan,
     estimate_piecewise_training_plan,
     estimate_rms_adjusted_steps,
     fit_adjusted_probe_rank36_transfer,
-    fit_observed_later_mean_energy_slope,
+    fit_observed_later_mean_rms_velocity,
+    fit_observed_squeeze_retention_scale,
     fit_schedule_aware_probe_energy_model,
+    rescale_observed_later_mean_rms_velocity,
     round_steps_to_nearest_multiple,
     should_run_adjusted_probe,
     update_piecewise_production_prediction,
@@ -770,8 +778,17 @@ class NetworkTrainer:
             "ss_rms_probe_estimated_max_train_steps": getattr(args, "_rms_probe_estimated_max_train_steps", None),
             "ss_rms_probe_dataset_batches_per_epoch": getattr(args, "_rms_probe_dataset_batches_per_epoch", None),
             "ss_rms_probe_energy_slope": getattr(args, "_rms_probe_energy_slope", None),
-            "ss_rms_probe_later_mean_energy_slope": getattr(
-                args, "_rms_probe_later_mean_energy_slope", None
+            "ss_rms_probe_later_mean_rms_velocity": getattr(
+                args, "_rms_probe_later_mean_rms_velocity", None
+            ),
+            "ss_rms_probe_trajectory_model_version": getattr(
+                args, "_rms_probe_trajectory_model_version", None
+            ),
+            "ss_rms_probe_squeeze_retention_scale": getattr(
+                args, "_rms_probe_squeeze_retention_scale", None
+            ),
+            "ss_rms_probe_later_energy_exponent": getattr(
+                args, "_rms_probe_later_energy_exponent", None
             ),
             "ss_rms_probe_gradient_accumulation_target_microbatches": (
                 args.rms_probe_gradient_accumulation_target_microbatches
@@ -1145,11 +1162,13 @@ class NetworkTrainer:
                 "gradient_accumulation_steps": probe_args.gradient_accumulation_steps,
                 "observed_rms": probe_result["total_rms"],
                 "rms_curve": probe_result["rms_curve"],
+                "squeeze_retentions": probe_result.get("squeeze_retentions", []),
                 "output_dir": probe_args.output_dir,
             }
         )
         model_reference_rms = probe_result["total_rms"]
         model_details = {}
+        primary_observed_later_velocity = None
         if original_args.rms_probe_scaling_policy == PIECEWISE_ENERGY_POLICY:
             (
                 model_reference_rms,
@@ -1166,6 +1185,31 @@ class NetworkTrainer:
             primary_probe_reference_rms = model_reference_rms
             primary_probe_energy_slope = initial_probe_slope
             primary_probe_rms_curve = probe_result["rms_curve"]
+            primary_probe_gradient_accumulation_steps = (
+                probe_args.gradient_accumulation_steps
+            )
+            (
+                primary_observed_later_velocity,
+                primary_observed_later_details,
+            ) = fit_observed_later_mean_rms_velocity(
+                primary_probe_rms_curve,
+                original_steps,
+                probe_args._training_step_limit,
+                primary_probe_reference_rms,
+                original_args.rms_probe_curve_every_n_steps,
+                first_segment_ratio,
+                final_segment_ratio,
+            )
+            primary_observed_retention_means = [
+                record.get("retained_energy_mean")
+                for record in probe_result.get("squeeze_retentions", [])
+            ]
+            (
+                primary_squeeze_retention_scale,
+                primary_squeeze_retention_details,
+            ) = fit_observed_squeeze_retention_scale(
+                primary_observed_retention_means
+            )
             (
                 estimated_steps,
                 step_multiplier,
@@ -1199,8 +1243,67 @@ class NetworkTrainer:
                     original_args.rms_probe_adjusted_steps_divisible_by
                 ),
                 probe_energy_slope=initial_probe_slope,
+                later_mean_rms_velocity=primary_observed_later_velocity,
+                later_mean_rms_velocity_reference_gradient_accumulation_steps=(
+                    primary_probe_gradient_accumulation_steps
+                ),
                 first_segment_ratio=first_segment_ratio,
                 final_segment_ratio=final_segment_ratio,
+                squeeze_retention_scale=primary_squeeze_retention_scale,
+            )
+            model_details.update(initial_probe_fit_details)
+            model_details.update(primary_observed_later_details)
+            model_details.update(primary_squeeze_retention_details)
+            model_details.update(
+                {
+                    f"primary_probe_{name}": value
+                    for name, value in {
+                        **primary_observed_later_details,
+                        **primary_squeeze_retention_details,
+                    }.items()
+                }
+            )
+        elif original_args.rms_probe_scaling_policy == LOGLINEAR_POLICY:
+            (
+                model_reference_rms,
+                _,
+                initial_probe_fit_details,
+            ) = fit_schedule_aware_probe_energy_model(
+                probe_result["rms_curve"],
+                original_steps,
+                CALIBRATION_PROBE_STEPS,
+                original_args.rms_probe_curve_every_n_steps,
+            )
+            (
+                estimated_steps,
+                step_multiplier,
+                adjusted_steps,
+                uncapped_adjusted_gradient_accumulation_steps,
+                adjusted_gradient_accumulation_steps,
+                model_details,
+            ) = estimate_loglinear_training_plan(
+                original_steps=original_steps,
+                final_target_rms=original_args.rms_probe_final_target,
+                reference_rms=model_reference_rms,
+                dataset_batches_per_epoch=probe_result["dataset_batches_per_epoch"],
+                current_gradient_accumulation_steps=(
+                    original_args.gradient_accumulation_steps
+                ),
+                probe_gradient_accumulation_steps=(
+                    probe_args.gradient_accumulation_steps
+                ),
+                target_microbatches=(
+                    original_args.rms_probe_gradient_accumulation_target_microbatches
+                ),
+                minimum_gradient_accumulation_steps=(
+                    original_args.rms_probe_min_gradient_accumulation_steps
+                ),
+                gradient_accumulation_rounding_bias=(
+                    original_args.rms_probe_gradient_accumulation_rounding_bias
+                ),
+                adjusted_steps_divisible_by=(
+                    original_args.rms_probe_adjusted_steps_divisible_by
+                ),
             )
             model_details.update(initial_probe_fit_details)
         else:
@@ -1258,16 +1361,19 @@ class NetworkTrainer:
                 False,
                 first_segment_ratio,
                 final_segment_ratio,
+                primary_observed_later_velocity is not None,
             )
         )
-        if should_run_adjusted_probe(
+        run_adjusted_probe = should_run_adjusted_probe(
             original_args.rms_probe_scaling_policy,
             adjusted_steps,
             original_args.rms_probe_steps,
             original_args.rms_probe_force_adjusted_probe,
             first_segment_ratio,
             final_segment_ratio,
-        ):
+            primary_observed_later_velocity is not None,
+        )
+        if run_adjusted_probe:
             provisional_steps = adjusted_steps
             provisional_gradient_accumulation = adjusted_gradient_accumulation_steps
             first_estimated_steps = estimated_steps
@@ -1347,6 +1453,7 @@ class NetworkTrainer:
                     "gradient_accumulation_steps": probe_args.gradient_accumulation_steps,
                     "observed_rms": probe_result["total_rms"],
                     "rms_curve": probe_result["rms_curve"],
+                    "squeeze_retentions": probe_result.get("squeeze_retentions", []),
                     "output_dir": probe_args.output_dir,
                 }
             )
@@ -1378,8 +1485,12 @@ class NetworkTrainer:
                 primary_probe_energy_slope,
                 first_segment_ratio,
                 final_segment_ratio,
+                primary_total_steps=original_steps,
             )
-            observed_later_slope, observed_later_details = fit_observed_later_mean_energy_slope(
+            (
+                adjusted_observed_later_velocity,
+                adjusted_observed_later_details,
+            ) = fit_observed_later_mean_rms_velocity(
                 probe_result["rms_curve"],
                 provisional_steps,
                 adjusted_probe_training_steps,
@@ -1387,6 +1498,56 @@ class NetworkTrainer:
                 original_args.rms_probe_curve_every_n_steps,
                 first_segment_ratio,
                 final_segment_ratio,
+            )
+            adjusted_observed_retention_means = [
+                record.get("retained_energy_mean")
+                for record in probe_result.get("squeeze_retentions", [])
+            ]
+            primary_velocity_at_adjusted_conditions = None
+            primary_velocity_transfer_details = {}
+            if primary_observed_later_velocity is not None:
+                (
+                    primary_velocity_at_adjusted_conditions,
+                    primary_velocity_transfer_details,
+                ) = rescale_observed_later_mean_rms_velocity(
+                    primary_observed_later_velocity,
+                    probe_result["dataset_batches_per_epoch"],
+                    primary_probe_reference_rms,
+                    primary_probe_gradient_accumulation_steps,
+                    primary_probe_energy_slope,
+                    transferred_probe_reference_rms,
+                    provisional_gradient_accumulation,
+                    transferred_probe_slope,
+                )
+            (
+                observed_later_velocity,
+                combined_observed_later_details,
+            ) = combine_observed_later_mean_rms_velocities(
+                (
+                    (
+                        primary_velocity_at_adjusted_conditions,
+                        primary_observed_later_details,
+                    ),
+                    (
+                        adjusted_observed_later_velocity,
+                        adjusted_observed_later_details,
+                    ),
+                )
+            )
+            (
+                combined_observed_retention_means,
+                combined_observed_retention_details,
+            ) = combine_observed_squeeze_retentions(
+                (
+                    primary_observed_retention_means,
+                    adjusted_observed_retention_means,
+                )
+            )
+            (
+                observed_squeeze_retention_scale,
+                observed_squeeze_retention_details,
+            ) = fit_observed_squeeze_retention_scale(
+                combined_observed_retention_means
             )
             (
                 estimated_steps,
@@ -1425,15 +1586,25 @@ class NetworkTrainer:
                     original_args.rms_probe_adjusted_steps_divisible_by
                 ),
                 probe_energy_slope=transferred_probe_slope,
-                later_mean_energy_slope=observed_later_slope,
-                later_mean_energy_slope_reference_gradient_accumulation_steps=(
+                later_mean_rms_velocity=observed_later_velocity,
+                later_mean_rms_velocity_reference_gradient_accumulation_steps=(
                     provisional_gradient_accumulation
                 ),
                 first_segment_ratio=first_segment_ratio,
                 final_segment_ratio=final_segment_ratio,
+                squeeze_retention_scale=observed_squeeze_retention_scale,
             )
             model_reference_rms = transferred_probe_reference_rms
             model_details.update(initial_probe_fit_details)
+            model_details.update(
+                {
+                    f"primary_probe_{name}": value
+                    for name, value in {
+                        **primary_observed_later_details,
+                        **primary_squeeze_retention_details,
+                    }.items()
+                }
+            )
             model_details.update(
                 {
                     f"adjusted_probe_rank36_{name}": value
@@ -1441,8 +1612,22 @@ class NetworkTrainer:
                 }
             )
             model_details.update(rank36_transfer_details)
-            model_details.update(observed_later_details)
+            model_details.update(combined_observed_later_details)
+            model_details.update(combined_observed_retention_details)
+            model_details.update(observed_squeeze_retention_details)
             model_details.update(adjusted_probe_budget_details)
+            model_details.update(
+                {
+                    f"adjusted_probe_{name}": value
+                    for name, value in adjusted_observed_later_details.items()
+                }
+            )
+            model_details.update(
+                {
+                    f"primary_probe_velocity_transfer_{name}": value
+                    for name, value in primary_velocity_transfer_details.items()
+                }
+            )
             model_details.update(
                 {
                     "probe_index": 2.0,
@@ -1646,8 +1831,17 @@ class NetworkTrainer:
         production_args._rms_probe_estimated_max_train_steps = estimated_steps
         production_args._rms_probe_dataset_batches_per_epoch = probe_result["dataset_batches_per_epoch"]
         production_args._rms_probe_energy_slope = model_details.get("probe_energy_slope_per_1000_steps")
-        production_args._rms_probe_later_mean_energy_slope = model_details.get(
-            "later_mean_energy_slope_per_1000_steps"
+        production_args._rms_probe_later_mean_rms_velocity = model_details.get(
+            "later_mean_rms_velocity_per_1000_steps"
+        )
+        production_args._rms_probe_trajectory_model_version = model_details.get(
+            "trajectory_model_version"
+        )
+        production_args._rms_probe_squeeze_retention_scale = model_details.get(
+            "squeeze_retention_scale"
+        )
+        production_args._rms_probe_later_energy_exponent = model_details.get(
+            "later_energy_exponent"
         )
         production_args._rms_probe_original_gradient_accumulation_steps = original_args.gradient_accumulation_steps
         production_args._is_rms_probe_run = False
@@ -1774,6 +1968,47 @@ class NetworkTrainer:
                 "No data found. Please verify arguments (train_data_dir must be the parent of folders with images) / 画像がありません。引数指定を確認してください（train_data_dirには画像があるフォルダではなく、画像があるフォルダの親フォルダを指定する必要があります）"
             )
             return
+
+        if args.rms_probe_scaling_policy == FORMULA_POLICY:
+            # No probe run: choose steps and gradient accumulation from the dataset size before
+            # the accelerator, the squeeze schedule and the LR scheduler are built. The result
+            # depends only on the config and the dataset, so a resumed run gets the same plan.
+            formula_original_steps = args.max_train_steps
+            formula_original_accumulation = args.gradient_accumulation_steps
+            (
+                formula_estimated_steps,
+                formula_adjusted_steps,
+                formula_accumulation,
+                formula_details,
+            ) = estimate_formula_training_plan(
+                final_target_rms=args.rms_probe_final_target,
+                dataset_batches_per_epoch=len(train_dataset_group),
+                current_gradient_accumulation_steps=formula_original_accumulation,
+                target_microbatches=args.rms_probe_gradient_accumulation_target_microbatches,
+                minimum_gradient_accumulation_steps=args.rms_probe_min_gradient_accumulation_steps,
+                gradient_accumulation_rounding_bias=args.rms_probe_gradient_accumulation_rounding_bias,
+                adjusted_steps_divisible_by=args.rms_probe_adjusted_steps_divisible_by,
+            )
+            args.max_train_steps = formula_adjusted_steps
+            args.gradient_accumulation_steps = formula_accumulation
+            training_step_limit = formula_adjusted_steps
+            args._rms_probe_original_max_train_steps = formula_original_steps
+            args._rms_probe_estimated_max_train_steps = formula_estimated_steps
+            args._rms_probe_step_multiplier = formula_estimated_steps / formula_original_steps
+            args._rms_probe_dataset_batches_per_epoch = len(train_dataset_group)
+            args._rms_probe_original_gradient_accumulation_steps = formula_original_accumulation
+            logger.info(
+                "formula_v1 plan: %s batches per epoch, final_target=%.8g -> max_train_steps %s -> %s "
+                "(estimated %s), gradient accumulation %s -> %s, predicted final RMS %.8g",
+                len(train_dataset_group),
+                args.rms_probe_final_target,
+                formula_original_steps,
+                formula_adjusted_steps,
+                formula_estimated_steps,
+                formula_original_accumulation,
+                formula_accumulation,
+                formula_details["predicted_final_rms_at_adjusted_steps"],
+            )
 
         if cache_latents:
             assert (
@@ -2491,6 +2726,7 @@ class NetworkTrainer:
         last_total_rms = None
         probe_observed_rms = None
         probe_rms_curve = []
+        probe_squeeze_retentions = []
         # commands from outside (run control). They are executed after an optimizer step, in the eval mode of the optimizer.
         # `global_step` and `epoch` are the values at that time.
         def command_sample(command: dict) -> dict:
@@ -2694,9 +2930,10 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
-                    if lora_squeeze.run_after_optimizer_step(
+                    squeezed_this_step = lora_squeeze.run_after_optimizer_step(
                         lora_squeeze_controller, lora_squeeze_step_context, global_step
-                    ):
+                    )
+                    if squeezed_this_step:
                         (
                             optimizer_name,
                             optimizer_args,
@@ -2706,6 +2943,23 @@ class NetworkTrainer:
                             lr_scheduler,
                             lr_descriptions,
                         ) = lora_squeeze_controller.export_training_state()
+                        if getattr(args, "_is_rms_probe_run", False):
+                            transition_stats = (
+                                lora_squeeze_step_context.transition_stats
+                                if lora_squeeze_step_context is not None
+                                else None
+                            ) or {}
+                            probe_squeeze_retentions.append(
+                                {
+                                    "step": global_step,
+                                    "retained_energy_mean": transition_stats.get(
+                                        "retained_energy_mean"
+                                    ),
+                                    "retained_energy_global": transition_stats.get(
+                                        "retained_energy_global"
+                                    ),
+                                }
+                            )
 
                     if (
                         args.total_rms_check_every_n_steps > 0
@@ -2986,6 +3240,7 @@ class NetworkTrainer:
                 "global_step": global_step,
                 "total_rms": probe_observed_rms,
                 "rms_curve": probe_rms_curve,
+                "squeeze_retentions": probe_squeeze_retentions,
                 "dataset_batches_per_epoch": len(train_dataloader),
                 "is_main_process": is_main_process,
             }
@@ -3026,17 +3281,22 @@ def setup_parser() -> argparse.ArgumentParser:
         "--rms_probe_scaling_policy",
         type=str,
         default="linear",
-        choices=["linear", "piecewise_energy_v1"],
+        choices=["linear", "piecewise_energy_v1", "loglinear_v1", "formula_v1"],
         help=(
             "step estimation policy: linear preserves the original target/observed scaling; "
-            "piecewise_energy_v1 uses the calibrated Anima 36->9 RMS-squared curve model"
+            "piecewise_energy_v1 uses calibrated rank-36 RMS-squared growth and "
+            "compressed-stage normalized RMS velocity for Anima 36->9; "
+            "loglinear_v1 uses one log-linear fit of the final RMS on steps, "
+            "optimizer steps per epoch, and the step-500 probe RMS for Anima 36->9; "
+            "formula_v1 runs no probe and picks steps and gradient accumulation from "
+            "--rms_probe_final_target and the dataset size alone for Anima 36->9"
         ),
     )
     parser.add_argument(
         "--rms_probe_final_target",
         type=float,
         default=None,
-        help="desired final total scaled LoRA RMS; required by piecewise_energy_v1",
+        help="desired final total scaled LoRA RMS; required by piecewise_energy_v1, loglinear_v1 and formula_v1",
     )
     parser.add_argument(
         "--rms_probe_steps",
