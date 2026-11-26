@@ -286,7 +286,7 @@ def squeeze_lora_network(
     revived_rank_channels = 0
     rank_deficient_modules = 0
     transfers: List[Tuple[torch.nn.Parameter, Dict[str, Any]]] = []
-    state_counts = {"projected": 0, "reset": 0, "empty": 0, "warm_restarted": 0}
+    state_counts = {"projected": 0, "reset": 0, "empty": 0}
     with torch.no_grad():
         for module in modules:
             old_spec = module.lora_squeeze_get_spec()
@@ -340,8 +340,6 @@ def squeeze_lora_network(
                         state_counts["projected"] += 1
                     elif status == "empty":
                         state_counts["empty"] += 1
-                    elif status.startswith("warm_restart:"):
-                        state_counts["warm_restarted"] += 1
                     else:
                         state_counts["reset"] += 1
                 transfers.append((new_spec.up_parameter, new_up_state))
@@ -361,7 +359,6 @@ def squeeze_lora_network(
             "optimizer_state_projected": float(state_counts["projected"]),
             "optimizer_state_reset": float(state_counts["reset"]),
             "optimizer_state_empty": float(state_counts["empty"]),
-            "optimizer_state_warm_restarted": float(state_counts["warm_restarted"]),
         },
         transfers,
     )

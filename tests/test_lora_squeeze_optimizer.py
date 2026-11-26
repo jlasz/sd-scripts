@@ -62,45 +62,6 @@ def test_partial_optimizer_offload_rolls_back(monkeypatch):
     assert torch.equal(optimizer.state[second]["buffer"], torch.ones_like(second))
 
 
-def test_sgd_momentum_uses_parameter_displacement_projection():
-    old_parameter = nn.Parameter(torch.zeros(3, 4))
-    new_parameter = nn.Parameter(torch.zeros(3, 2))
-    optimizer = torch.optim.SGD([old_parameter], lr=0.1, momentum=0.9)
-    momentum = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    optimizer.state[old_parameter]["momentum_buffer"] = momentum.clone()
-    projection = torch.tensor([[2.0, 0.0], [0.0, 0.5], [0.0, 0.0], [0.0, 0.0]])
-
-    projected, status = prepare_optimizer_state_transfer(optimizer).project_parameter_state(
-        old_parameter, new_parameter, projection, "up"
-    )
-    expected = momentum @ torch.linalg.pinv(projection.T)
-
-    assert status == "projected"
-    assert torch.allclose(projected["momentum_buffer"], expected)
-    assert not torch.allclose(projected["momentum_buffer"], momentum @ projection)
-
-    next_optimizer = torch.optim.SGD([new_parameter], lr=0.1, momentum=0.9)
-    next_optimizer.state[new_parameter] = projected
-    new_parameter.grad = torch.zeros_like(new_parameter)
-    next_optimizer.step()
-    assert torch.allclose(new_parameter, -0.09 * expected)
-
-
-def test_ill_conditioned_projection_fails_closed():
-    old_parameter = nn.Parameter(torch.zeros(1, 2))
-    new_parameter = nn.Parameter(torch.zeros(1, 1))
-    optimizer = torch.optim.SGD([old_parameter], momentum=0.9)
-    optimizer.state[old_parameter]["momentum_buffer"] = torch.ones_like(old_parameter)
-
-    with pytest.raises(ValueError, match="ill-conditioned.*per_squeeze"):
-        prepare_optimizer_state_transfer(optimizer).project_parameter_state(
-            old_parameter,
-            new_parameter,
-            torch.tensor([[1e-8], [0.0]]),
-            "up",
-        )
-
-
 def test_convolutional_adam_state_can_take_another_step_after_squeeze():
     torch.manual_seed(14)
     module = FakeLoRAModule(7, 5, 4, 2.0, kernel_size=3)
@@ -126,7 +87,7 @@ def test_convolutional_adam_state_can_take_another_step_after_squeeze():
 
 def test_unknown_optimizer_state_is_rejected_without_changing_layers():
     module = FakeLoRAModule(7, 5, 4, 2.0)
-    optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=0.1)
     for parameter in module.parameters():
         optimizer.state[parameter]["p0"] = torch.randn(parameter.numel())
 
@@ -135,114 +96,50 @@ def test_unknown_optimizer_state_is_rejected_without_changing_layers():
     assert module.lora_dim == 4
 
 
-def test_adafactor_preserves_relative_step_and_refactors_second_moment():
-    from transformers.optimization import Adafactor
-
-    torch.manual_seed(32)
+@pytest.mark.parametrize(
+    "optimizer_class",
+    [torch.optim.Adam, torch.optim.AdamW, torch.optim.RAdam, torch.optim.NAdam, torch.optim.Adamax],
+)
+def test_adam_family_state_is_projected(optimizer_class):
+    torch.manual_seed(3)
     module = FakeLoRAModule(7, 5, 4, 2.0)
     nn.init.normal_(module.lora_up.weight)
-    kwargs = dict(lr=None, beta1=0.9, relative_step=True, scale_parameter=True, warmup_init=False)
-    optimizer = Adafactor(module.parameters(), **kwargs)
-    for _ in range(3):
-        for parameter in module.parameters():
-            parameter.grad = torch.randn_like(parameter)
-        optimizer.step()
-        optimizer.zero_grad()
-
-    stats, transfers = squeeze_lora_network(
-        FakeNetwork(module), 2, target_alpha=1.0, optimizer_for_state_transfer=optimizer
-    )
-    new_optimizer = Adafactor(module.parameters(), **kwargs)
-    install_transfers(optimizer, new_optimizer, transfers)
-
-    assert stats["optimizer_state_projected"] == 2
+    optimizer = optimizer_class(module.parameters(), lr=1e-3)
     for parameter in module.parameters():
-        state = new_optimizer.state[parameter]
-        assert state["step"] == 3
-        assert state["exp_avg"].shape == parameter.shape
-        assert state["exp_avg_sq_row"].shape == parameter.shape[:-1]
-        assert state["exp_avg_sq_col"].shape == parameter.shape[:-2] + parameter.shape[-1:]
+        parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad()
 
-
-def test_prodigy_preserves_learned_scale_and_complete_state():
-    prodigyopt = pytest.importorskip("prodigyopt")
-    torch.manual_seed(31)
-    module = FakeLoRAModule(7, 5, 4, 2.0)
-    nn.init.normal_(module.lora_up.weight)
-    optimizer = prodigyopt.Prodigy(module.parameters(), lr=1.0, use_bias_correction=True)
-    for _ in range(3):
-        for parameter in module.parameters():
-            parameter.grad = torch.randn_like(parameter)
-        optimizer.step()
-        optimizer.zero_grad()
-
-    old_d = optimizer.param_groups[0]["d"]
-    old_k = optimizer.param_groups[0]["k"]
     stats, transfers = squeeze_lora_network(
         FakeNetwork(module), 2, target_alpha=1.0, optimizer_for_state_transfer=optimizer
     )
-    new_optimizer = prodigyopt.Prodigy(module.parameters(), lr=1.0, use_bias_correction=True)
+    new_optimizer = optimizer_class(module.parameters(), lr=1e-3)
     install_transfers(optimizer, new_optimizer, transfers)
+    for parameter in module.parameters():
+        parameter.grad = torch.randn_like(parameter)
+    new_optimizer.step()
 
     assert stats["optimizer_state_projected"] == 2
-    assert stats["optimizer_state_warm_restarted"] == 0
-    assert new_optimizer.param_groups[0]["d"] == old_d
-    assert new_optimizer.param_groups[0]["k"] == old_k
-    assert all(
-        set(new_optimizer.state[parameter]) == {"step", "s", "p0", "exp_avg", "exp_avg_sq"}
-        for parameter in module.parameters()
-    )
+    assert all(torch.isfinite(parameter).all() for parameter in module.parameters())
 
 
-def test_prodigy_plus_uses_a_coherent_warm_restart():
-    prodigyplus = pytest.importorskip("prodigyplus")
-    torch.manual_seed(35)
-    module = FakeLoRAModule(64, 64, 16, 8.0)
-    nn.init.normal_(module.lora_up.weight)
-    kwargs = {"lr": 1.0, "factored": True, "stochastic_rounding": False}
-    optimizer = prodigyplus.ProdigyPlusScheduleFree(module.parameters(), **kwargs)
-    for _ in range(2):
-        for parameter in module.parameters():
-            parameter.grad = torch.randn_like(parameter)
-        optimizer.step()
-        optimizer.zero_grad()
-    optimizer.param_groups[0]["d"] = 0.023
-
-    stats, transfers = squeeze_lora_network(
-        FakeNetwork(module), 8, target_alpha=4.0, optimizer_for_state_transfer=optimizer
-    )
-    new_optimizer = prodigyplus.ProdigyPlusScheduleFree(module.parameters(), **kwargs)
-    install_transfers(optimizer, new_optimizer, transfers)
-
-    assert stats["optimizer_state_warm_restarted"] == 2
-    assert [state for _, state in transfers] == [{}, {}]
-    assert new_optimizer.param_groups[0]["d"] == pytest.approx(0.023)
-
-
-def test_schedule_free_preserves_iteration_history():
-    schedulefree = pytest.importorskip("schedulefree")
-    torch.manual_seed(33)
+@pytest.mark.parametrize(
+    "optimizer_factory",
+    [
+        lambda params: torch.optim.SGD(params, lr=0.1, momentum=0.9),
+        lambda params: torch.optim.Adagrad(params, lr=0.1),
+        lambda params: torch.optim.RMSprop(params, lr=0.1),
+    ],
+)
+def test_non_adam_optimizers_are_rejected_in_global_mode(optimizer_factory):
     module = FakeLoRAModule(7, 5, 4, 2.0)
-    nn.init.normal_(module.lora_up.weight)
-    optimizer = schedulefree.AdamWScheduleFree(module.parameters(), lr=0.01)
-    optimizer.train()
-    for _ in range(3):
-        for parameter in module.parameters():
-            parameter.grad = torch.randn_like(parameter)
-        optimizer.step()
-        optimizer.zero_grad()
+    optimizer = optimizer_factory(module.parameters())
 
-    old_k = optimizer.param_groups[0]["k"]
-    stats, transfers = squeeze_lora_network(
-        FakeNetwork(module), 2, target_alpha=1.0, optimizer_for_state_transfer=optimizer
-    )
-    new_optimizer = schedulefree.AdamWScheduleFree(module.parameters(), lr=0.01)
-    new_optimizer.train()
-    install_transfers(optimizer, new_optimizer, transfers)
-
-    assert stats["optimizer_state_projected"] == 2
-    assert new_optimizer.param_groups[0]["k"] == old_k
-    assert all(new_optimizer.state[p]["z"].shape == p.shape for p in module.parameters())
+    with pytest.raises(ValueError, match="only Adam-family.*per_squeeze"):
+        prepare_optimizer_state_transfer(optimizer)
+    with pytest.raises(ValueError, match="only Adam-family"):
+        squeeze_lora_network(FakeNetwork(module), 2, target_alpha=1.0, optimizer_for_state_transfer=optimizer)
+    assert module.lora_dim == 4
 
 
 @pytest.mark.parametrize(

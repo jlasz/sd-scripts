@@ -283,7 +283,6 @@ class LoRASqueezeRuntime:
                 "optimizer_state_projected",
                 "optimizer_state_reset",
                 "optimizer_state_empty",
-                "optimizer_state_warm_restarted",
             ):
                 if key in context.transition_stats:
                     logs[f"lora_squeeze/{key}"] = context.transition_stats[key]
@@ -368,18 +367,6 @@ class LoRASqueezeRuntime:
         return [
             f"LoRA-Squeeze step distribution: {self.schedule.step_distribution_text()}",
             f"LoRA-Squeeze step schedule: {self.schedule.step_schedule_text()}",
-        ]
-
-    def optimizer_preflight_status_messages(self, optimizer_state_adapter: Optional[Any]) -> List[str]:
-        if (
-            not self.enabled
-            or optimizer_state_adapter is None
-            or optimizer_state_adapter.warm_restart_reason is None
-        ):
-            return []
-        return [
-            "LoRA-Squeeze global optimizer policy will preserve learned global scale and warm-restart "
-            f"coupled state: {optimizer_state_adapter.warm_restart_reason}"
         ]
 
     def optimizer_scheduler_status_messages(self, scheduler_training_steps: Optional[int]) -> List[str]:
@@ -594,18 +581,12 @@ class LoRASqueezeTrainingController:
         if global_optimizer_mode:
             reset_state_count = int(squeeze_stats.get("optimizer_state_reset", 0))
             empty_state_count = int(squeeze_stats.get("optimizer_state_empty", 0))
-            warm_restart_count = int(squeeze_stats.get("optimizer_state_warm_restarted", 0))
             self.accelerator.print(
                 "LoRA-Squeeze optimizer continued globally: "
                 f"rank={target_rank}, projected_states={projected_state_count}, "
-                f"warm_restarted_states={warm_restart_count}, reset_states={reset_state_count}, "
+                f"reset_states={reset_state_count}, "
                 f"empty_states={empty_state_count}"
             )
-            if warm_restart_count > 0:
-                self.accelerator.print(
-                    "LoRA-Squeeze optimizer used a coherent warm restart for unprojectable state; "
-                    "the optimizer's learned global scale was preserved"
-                )
             if reset_state_count > 0:
                 self.accelerator.print(
                     "LoRA-Squeeze warning: global optimizer mode continued optimizer param-group state, "

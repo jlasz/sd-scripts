@@ -1,14 +1,13 @@
-"""Optimizer-aware state transfer for in-training LoRA rank changes.
+"""Optimizer state transfer for in-training LoRA rank changes.
 
-Optimizer tensors do not all live in the same coordinate space. Gradient moments
-are covectors, update/momentum buffers are vectors, and anchors/averages are
-points in parameter space.  LoRA-Squeeze therefore uses explicit optimizer
-policies instead of guessing from state-key names.
+Global optimizer mode is limited to Adam-family optimizers (PyTorch Adam, AdamW,
+RAdam, NAdam and Adamax, plus the bitsandbytes Adam/AdamW variants). Their
+per-parameter state is gradient moments, which are projected as covectors.
+Every other optimizer must use --lora_squeeze_optimizer_mode=per_squeeze.
 """
 
 import copy
-import math
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -20,10 +19,6 @@ class OptimizerStateCPUStagingError(RuntimeError):
 GRADIENT = "gradient"
 GRADIENT_SQUARED = "gradient_squared"
 GRADIENT_ABS_MAX = "gradient_abs_max"
-VECTOR = "vector"
-VECTOR_SQUARED = "vector_squared"
-POSITION = "position"
-MAX_VECTOR_PROJECTION_ABS = 1e6
 
 
 def _move_optimizer_state_value(value: Any, device: torch.device, move_scalar_tensors: bool = True) -> Any:
@@ -188,21 +183,6 @@ def _project_2d(
     raise ValueError(f"unknown LoRA optimizer-state role: {role}")
 
 
-def _vector_projection(projection: torch.Tensor) -> torch.Tensor:
-    # Gradients are covectors. Parameter displacements use the pseudoinverse of
-    # the transpose so that <gradient, displacement> is retained in the kept
-    # subspace as closely as possible.
-    result = torch.linalg.pinv(projection.T)
-    if not torch.isfinite(result).all():
-        raise ValueError("optimizer vector-state projection produced non-finite values")
-    if result.numel() > 0 and float(result.detach().abs().max()) > MAX_VECTOR_PROJECTION_ABS:
-        raise ValueError(
-            "optimizer vector-state projection is ill-conditioned; use "
-            "--lora_squeeze_optimizer_mode=per_squeeze"
-        )
-    return result
-
-
 def _project_full_state_tensor(
     value: torch.Tensor,
     old_parameter: torch.nn.Parameter,
@@ -215,9 +195,7 @@ def _project_full_state_tensor(
     state_2d = _parameter_tensor_to_2d(shaped.detach().float(), role)
     projection = projection.detach().to(device=state_2d.device, dtype=state_2d.dtype)
 
-    if kind in (VECTOR, VECTOR_SQUARED):
-        projection = _vector_projection(projection)
-    if kind in (GRADIENT_SQUARED, VECTOR_SQUARED):
+    if kind == GRADIENT_SQUARED:
         projection = projection.square()
 
     if kind == GRADIENT_ABS_MAX:
@@ -227,7 +205,7 @@ def _project_full_state_tensor(
         projected = _project_2d(state_2d.abs(), projection.abs(), role).clamp_min_(0)
     else:
         projected = _project_2d(state_2d, projection, role)
-        if kind in (GRADIENT_SQUARED, VECTOR_SQUARED):
+        if kind == GRADIENT_SQUARED:
             projected.clamp_min_(0)
 
     if projected.numel() != new_parameter.numel() or not torch.isfinite(projected).all():
@@ -236,41 +214,10 @@ def _project_full_state_tensor(
     return projected.to(device=new_parameter.device, dtype=value.dtype)
 
 
-def _project_position_state(
-    value: torch.Tensor,
-    old_parameter: torch.nn.Parameter,
-    new_parameter: torch.nn.Parameter,
-    projection: torch.Tensor,
-    role: str,
-) -> torch.Tensor:
-    was_flat = value.ndim == 1 and value.numel() == old_parameter.numel()
-    if value.numel() == 1 and value.item() == 0:
-        # Prodigy stores an all-zero anchor as a scalar to save memory.
-        shaped = torch.zeros_like(old_parameter)
-        was_flat = True
-    else:
-        shaped, was_flat = _state_tensor_to_parameter_shape(value, old_parameter)
-
-    displacement = shaped.detach().float() - old_parameter.detach().float()
-    mapped = _project_full_state_tensor(
-        displacement,
-        old_parameter,
-        new_parameter,
-        projection,
-        role,
-        VECTOR,
-    )
-    mapped_shaped = mapped.reshape(new_parameter.shape).float()
-    position = new_parameter.detach().float() + mapped_shaped
-    position = position.flatten() if was_flat else position
-    return position.to(device=new_parameter.device, dtype=value.dtype)
-
-
 class OptimizerStateTransferAdapter:
     display_name = "optimizer"
     scalar_keys = {"step"}
     state_rules: Dict[str, str] = {}
-    warm_restart_reason: Optional[str] = None
 
     def __init__(self, optimizer: torch.optim.Optimizer):
         self.optimizer = optimizer
@@ -298,8 +245,6 @@ class OptimizerStateTransferAdapter:
         state = self.optimizer.state.get(old_parameter, {})
         if not state:
             return {}, "empty"
-        if self.warm_restart_reason is not None:
-            return {}, "warm_restart:" + self.warm_restart_reason
 
         projected: Dict[str, Any] = {}
         for key, value in state.items():
@@ -310,15 +255,9 @@ class OptimizerStateTransferAdapter:
                 continue
             if not isinstance(value, torch.Tensor) or not torch.is_floating_point(value):
                 raise ValueError(f"{self.qualified_name} state {key!r} is not a floating-point tensor")
-            kind = self.state_rules[key]
-            if kind == POSITION:
-                projected[key] = _project_position_state(
-                    value, old_parameter, new_parameter, projection, role
-                )
-            else:
-                projected[key] = _project_full_state_tensor(
-                    value, old_parameter, new_parameter, projection, role, kind
-                )
+            projected[key] = _project_full_state_tensor(
+                value, old_parameter, new_parameter, projection, role, self.state_rules[key]
+            )
         return projected, "projected"
 
     def copy_group_state(
@@ -352,285 +291,6 @@ def _validate_group_layout(old_optimizer: torch.optim.Optimizer, new_optimizer: 
         )
     if len(old_optimizer.param_groups) != len(new_optimizer.param_groups):
         raise ValueError("LoRA-Squeeze global optimizer mode changed the optimizer parameter-group count")
-
-
-def _copy_group_keys(old_optimizer, new_optimizer, keys: Iterable[str]):
-    _validate_group_layout(old_optimizer, new_optimizer)
-    for old_group, new_group in zip(old_optimizer.param_groups, new_optimizer.param_groups):
-        for key in keys:
-            if key in old_group:
-                new_group[key] = _clone_value(old_group[key])
-
-
-def _all_states(optimizer: torch.optim.Optimizer) -> Iterable[Dict[str, Any]]:
-    return optimizer.state.values()
-
-
-def _state_abs_sum(states: Iterable[Dict[str, Any]], key: str) -> float:
-    return sum(float(state[key].detach().float().abs().sum()) for state in states if key in state)
-
-
-def _state_l2_norm(states: Iterable[Dict[str, Any]], key: str) -> float:
-    squared = sum(float(state[key].detach().float().square().sum()) for state in states if key in state)
-    return math.sqrt(max(0.0, squared))
-
-
-def _transferred_states(transfers) -> Iterable[Dict[str, Any]]:
-    return (state for _, state in transfers)
-
-
-def _scaled_history(value: Any, old_norm: float, new_norm: float) -> Any:
-    if old_norm <= 0 or new_norm <= 0:
-        return type(value)(0) if not isinstance(value, torch.Tensor) else torch.zeros_like(value)
-    ratio = new_norm / old_norm
-    return value * ratio
-
-
-class ProdigyAdapter(RuleBasedAdapter):
-    def __init__(self, optimizer):
-        super().__init__(
-            optimizer,
-            "Prodigy",
-            {"s": GRADIENT, "p0": POSITION, "exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED},
-        )
-
-    def preflight(self):
-        unexpected = self._unexpected_state_keys()
-        slice_values = {group.get("slice_p", 1) for group in self.optimizer.param_groups}
-        if slice_values != {1}:
-            self.warm_restart_reason = "Prodigy slice_p state cannot be unsliced after a rank change"
-        elif unexpected:
-            self.warm_restart_reason = "unsupported Prodigy state: " + ",".join(unexpected)
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _validate_group_layout(self.optimizer, new_optimizer)
-        if self.warm_restart_reason is not None:
-            _copy_group_keys(self.optimizer, new_optimizer, ("d", "d_max"))
-            return
-
-        old_norm = _state_abs_sum(_all_states(self.optimizer), "s")
-        new_norm = _state_abs_sum(_transferred_states(transfers), "s")
-        for old_group, new_group in zip(self.optimizer.param_groups, new_optimizer.param_groups):
-            for key in ("d", "d_max", "k"):
-                if key in old_group:
-                    new_group[key] = _clone_value(old_group[key])
-            numerator = _scaled_history(old_group.get("d_numerator", 0.0), old_norm, new_norm)
-            new_group["d_numerator"] = numerator
-            new_group["d_denom"] = new_norm
-            d_coef = new_group.get("d_coef", 1.0)
-            new_group["d_hat"] = new_group.get("d", 0.0) if new_norm == 0 else d_coef * numerator / new_norm
-
-
-class ProdigyPlusWarmRestartAdapter(OptimizerStateTransferAdapter):
-    """Preserve the learned LR while restarting inseparable sliced/SF state.
-
-    ProdigyPlusScheduleFree 1.9.x stores its Prodigy anchor/accumulator at a
-    fixed 1-in-11 slice and combines them with schedule-free points and optional
-    factored/experimental moments. Rank mixing makes that slice non-invertible.
-    Restarting every per-parameter buffer together is safer than constructing a
-    hybrid, while retaining ``d`` avoids relearning the main LR estimate.
-    """
-
-    def __init__(self, optimizer):
-        super().__init__(optimizer)
-        self.warm_restart_reason = "ProdigyPlus sliced and schedule-free state is not jointly invertible"
-
-    def preflight(self):
-        pass
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _copy_group_keys(self.optimizer, new_optimizer, ("d", "d_prev", "shared_d"))
-
-
-class DAdaptRatioAdapter(RuleBasedAdapter):
-    def __init__(self, optimizer, display_name, rules, history_key, norm="l1"):
-        super().__init__(optimizer, display_name, rules)
-        self.history_key = history_key
-        self.norm = norm
-
-    def preflight(self):
-        unexpected = self._unexpected_state_keys()
-        if unexpected:
-            self.warm_restart_reason = "unsupported D-Adaptation state: " + ",".join(unexpected)
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _validate_group_layout(self.optimizer, new_optimizer)
-        if self.warm_restart_reason is not None:
-            _copy_group_keys(self.optimizer, new_optimizer, ("d",))
-            return
-        norm_fn = _state_l2_norm if self.norm == "l2" else _state_abs_sum
-        old_norm = norm_fn(_all_states(self.optimizer), "s")
-        new_norm = norm_fn(_transferred_states(transfers), "s")
-        for old_group, new_group in zip(self.optimizer.param_groups, new_optimizer.param_groups):
-            for key in ("d", "k"):
-                if key in old_group:
-                    new_group[key] = _clone_value(old_group[key])
-            value = _scaled_history(old_group.get(self.history_key, 0.0), old_norm, new_norm)
-            new_group[self.history_key] = value
-
-
-def _adan_metrics(states: Iterable[Dict[str, Any]], eps: float) -> Tuple[float, float]:
-    weighted_sq = 0.0
-    l1 = 0.0
-    for state in states:
-        if "s" not in state or "exp_avg_sq" not in state:
-            continue
-        s = state["s"].detach().float()
-        denom = state["exp_avg_sq"].detach().float().clamp_min(0).sqrt().add(eps)
-        weighted_sq += float((s.square() / denom).sum())
-        l1 += float(s.abs().sum())
-    return weighted_sq, l1
-
-
-class DAdaptAdanAdapter(RuleBasedAdapter):
-    def __init__(self, optimizer, display_name):
-        super().__init__(
-            optimizer,
-            display_name,
-            {
-                "s": GRADIENT,
-                "exp_avg": GRADIENT,
-                "exp_avg_diff": GRADIENT,
-                "exp_avg_sq": GRADIENT_SQUARED,
-                "pre_grad": GRADIENT,
-            },
-        )
-
-    def preflight(self):
-        unexpected = self._unexpected_state_keys()
-        if unexpected:
-            self.warm_restart_reason = "unsupported D-Adaptation Adan state: " + ",".join(unexpected)
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _validate_group_layout(self.optimizer, new_optimizer)
-        if self.warm_restart_reason is not None:
-            _copy_group_keys(self.optimizer, new_optimizer, ("d",))
-            return
-        old_group = self.optimizer.param_groups[0]
-        eps = float(old_group.get("eps", 1e-8))
-        beta = float(old_group.get("betas", (0.98, 0.92, 0.99))[-1])
-        old_sq, old_l1 = _adan_metrics(_all_states(self.optimizer), eps)
-        new_sq, new_l1 = _adan_metrics(_transferred_states(transfers), eps)
-        old_history = float(old_group.get("gsq_weighted", 0.0))
-        old_d_hat = 0.0 if old_l1 == 0 else (old_sq / (1 - beta) - old_history) / old_l1
-        new_history = max(0.0, new_sq / (1 - beta) - old_d_hat * new_l1)
-        for source, target in zip(self.optimizer.param_groups, new_optimizer.param_groups):
-            target["d"] = _clone_value(source.get("d", target.get("d")))
-            target["k"] = _clone_value(source.get("k", target.get("k", 0)))
-            target["gsq_weighted"] = new_history
-
-
-class DAdaptSGDAdapter(RuleBasedAdapter):
-    def __init__(self, optimizer):
-        super().__init__(optimizer, "DAdaptSGD", {"s": VECTOR, "x0": POSITION, "z": POSITION})
-
-    def project_parameter_state(self, old_parameter, new_parameter, projection, role):
-        projected, status = super().project_parameter_state(old_parameter, new_parameter, projection, role)
-        if projected and "x0" in projected and "s" in projected:
-            projected["z"] = projected["x0"] - projected["s"]
-        return projected, status
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _validate_group_layout(self.optimizer, new_optimizer)
-        old_norm = _state_l2_norm(_all_states(self.optimizer), "s")
-        new_norm = _state_l2_norm(_transferred_states(transfers), "s")
-        for old_group, new_group in zip(self.optimizer.param_groups, new_optimizer.param_groups):
-            new_group["d"] = _clone_value(old_group.get("d", new_group.get("d")))
-            new_group["numerator_weighted"] = _scaled_history(
-                old_group.get("numerator_weighted", 0.0), old_norm, new_norm
-            )
-            # Re-measure the initial gradient norm in the new coordinates.
-            new_group["k"] = 0
-            new_group.pop("g0_norm", None)
-
-
-class DAdaptAdaGradAdapter(RuleBasedAdapter):
-    def __init__(self, optimizer):
-        super().__init__(optimizer, "DAdaptAdaGrad", {"alphak": GRADIENT_SQUARED, "sk": GRADIENT, "x0": POSITION})
-
-    @staticmethod
-    def _metrics(states, eps):
-        weighted_sq = 0.0
-        l1 = 0.0
-        for state in states:
-            if "sk" not in state or "alphak" not in state:
-                continue
-            sk = state["sk"].detach().float()
-            denom = state["alphak"].detach().float().clamp_min(0).sqrt().add(eps)
-            weighted_sq += float((sk.square() / denom).sum())
-            l1 += float(sk.abs().sum())
-        return weighted_sq, l1
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _validate_group_layout(self.optimizer, new_optimizer)
-        group = self.optimizer.param_groups[0]
-        eps = float(group.get("eps", 1e-6))
-        old_sq, old_l1 = self._metrics(_all_states(self.optimizer), eps)
-        new_sq, new_l1 = self._metrics(_transferred_states(transfers), eps)
-        old_gsq = float(group.get("gsq_weighted", 0.0))
-        old_d_hat = 0.0 if old_l1 == 0 else (old_sq - old_gsq) / old_l1
-        new_gsq = max(0.0, new_sq - old_d_hat * new_l1)
-        for source, target in zip(self.optimizer.param_groups, new_optimizer.param_groups):
-            for key in ("d", "k"):
-                target[key] = _clone_value(source.get(key, target.get(key)))
-            target["sksq_weighted"] = new_sq
-            target["skl1"] = new_l1
-            target["gsq_weighted"] = new_gsq
-
-
-class AdafactorAdapter(OptimizerStateTransferAdapter):
-    scalar_keys = {"step", "RMS"}
-    state_rules = {"exp_avg": VECTOR, "exp_avg_sq": GRADIENT_SQUARED}
-
-    def preflight(self):
-        accepted = self.scalar_keys | set(self.state_rules) | {"exp_avg_sq_row", "exp_avg_sq_col"}
-        unexpected = sorted({key for state in self.optimizer.state.values() for key in state if key not in accepted})
-        if unexpected:
-            raise ValueError(f"unsupported Adafactor state for LoRA-Squeeze global mode: {unexpected}")
-
-    def project_parameter_state(self, old_parameter, new_parameter, projection, role):
-        state = self.optimizer.state.get(old_parameter, {})
-        if not state:
-            return {}, "empty"
-        projected = {key: _clone_value(value) for key, value in state.items() if key in self.scalar_keys}
-        if "exp_avg" in state:
-            projected["exp_avg"] = _project_full_state_tensor(
-                # Adafactor accumulates its already-preconditioned, LR-scaled
-                # update here (not the raw gradient), so this is a parameter
-                # vector rather than a gradient covector.
-                state["exp_avg"], old_parameter, new_parameter, projection, role, VECTOR
-            )
-        if "exp_avg_sq" in state:
-            projected["exp_avg_sq"] = _project_full_state_tensor(
-                state["exp_avg_sq"], old_parameter, new_parameter, projection, role, GRADIENT_SQUARED
-            )
-        elif "exp_avg_sq_row" in state and "exp_avg_sq_col" in state:
-            row = state["exp_avg_sq_row"].detach().float()
-            col = state["exp_avg_sq_col"].detach().float()
-            full = (row / row.mean(dim=-1, keepdim=True).clamp_min(1e-30)).unsqueeze(-1) * col.unsqueeze(-2)
-            full = full.to(device=old_parameter.device)
-            mapped = _project_full_state_tensor(
-                full, old_parameter, new_parameter, projection, role, GRADIENT_SQUARED
-            ).reshape(new_parameter.shape).float()
-            projected["exp_avg_sq_row"] = mapped.mean(dim=-1).to(
-                device=new_parameter.device, dtype=state["exp_avg_sq_row"].dtype
-            )
-            projected["exp_avg_sq_col"] = mapped.mean(dim=-2).to(
-                device=new_parameter.device, dtype=state["exp_avg_sq_col"].dtype
-            )
-        return projected, "projected"
-
-
-class ScheduleFreeAdapter(RuleBasedAdapter):
-    def __init__(self, optimizer, rules):
-        super().__init__(optimizer, type(optimizer).__name__, rules)
-
-    def copy_group_state(self, new_optimizer, transfers):
-        _copy_group_keys(
-            self.optimizer,
-            new_optimizer,
-            ("k", "train_mode", "weight_sum", "lr_max", "scheduled_lr"),
-        )
 
 
 class BitsAndBytesAdapter(OptimizerStateTransferAdapter):
@@ -743,18 +403,14 @@ def _torch_adapter(optimizer, class_name) -> Optional[OptimizerStateTransferAdap
         "AdamW": {"exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED, "max_exp_avg_sq": GRADIENT_SQUARED},
         "RAdam": {"exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED},
         "NAdam": {"exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED},
-        "SparseAdam": {"exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED},
-        "SGD": {"momentum_buffer": VECTOR},
-        "Adagrad": {"sum": GRADIENT_SQUARED},
-        "RMSprop": {"square_avg": GRADIENT_SQUARED, "grad_avg": GRADIENT, "momentum_buffer": VECTOR},
         "Adamax": {"exp_avg": GRADIENT, "exp_inf": GRADIENT_ABS_MAX},
-        "Adadelta": {"square_avg": GRADIENT_SQUARED, "acc_delta": VECTOR_SQUARED},
-        "ASGD": {"ax": POSITION},
     }
     scalar_keys = {
-        "Adam": {"step"}, "AdamW": {"step"}, "RAdam": {"step"}, "NAdam": {"step", "mu_product"},
-        "SparseAdam": {"step"}, "SGD": {"step"}, "Adagrad": {"step"}, "RMSprop": {"step"},
-        "Adamax": {"step"}, "Adadelta": {"step"}, "ASGD": {"step", "eta", "mu"},
+        "Adam": {"step"},
+        "AdamW": {"step"},
+        "RAdam": {"step"},
+        "NAdam": {"step", "mu_product"},
+        "Adamax": {"step"},
     }
     if class_name not in policies:
         return None
@@ -768,72 +424,14 @@ def prepare_optimizer_state_transfer(optimizer: torch.optim.Optimizer) -> Optimi
 
     if module.startswith("torch.optim"):
         adapter = _torch_adapter(optimizer, class_name)
-    elif module.startswith("lion_pytorch") and class_name == "Lion":
-        adapter = RuleBasedAdapter(optimizer, "Lion", {"exp_avg": GRADIENT})
-    elif module.startswith("prodigyopt") and class_name == "Prodigy":
-        adapter = ProdigyAdapter(optimizer)
-    elif module.startswith("prodigyplus") and class_name == "ProdigyPlusScheduleFree":
-        adapter = ProdigyPlusWarmRestartAdapter(optimizer)
-    elif module.startswith("dadaptation"):
-        if class_name == "DAdaptAdam":
-            adapter = DAdaptRatioAdapter(
-                optimizer,
-                class_name,
-                {"s": GRADIENT, "exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED},
-                "numerator_weighted",
-            )
-        elif class_name == "DAdaptLion":
-            adapter = DAdaptRatioAdapter(
-                optimizer, class_name, {"s": VECTOR, "exp_avg": GRADIENT}, "numerator_weighted"
-            )
-        elif class_name == "DAdaptAdanIP":
-            adapter = DAdaptRatioAdapter(
-                optimizer,
-                class_name,
-                # dadaptation 3.2's experimental IP implementation assigns the
-                # squared-update accumulator to exp_avg_diff and the signed
-                # gradient-difference accumulator to exp_avg_sq (despite their
-                # names), so follow the implementation actually stepped.
-                {
-                    "s": GRADIENT,
-                    "exp_avg": GRADIENT,
-                    "exp_avg_diff": GRADIENT_SQUARED,
-                    "exp_avg_sq": GRADIENT,
-                    "pre_grad": GRADIENT,
-                },
-                "numerator_weighted",
-            )
-        elif class_name in ("DAdaptAdan", "DAdaptAdamPreprint"):
-            rules_name = class_name
-            adapter = DAdaptAdanAdapter(optimizer, rules_name)
-            if class_name == "DAdaptAdamPreprint":
-                adapter.state_rules = {"s": GRADIENT, "exp_avg": GRADIENT, "exp_avg_sq": GRADIENT_SQUARED}
-        elif class_name == "DAdaptSGD":
-            adapter = DAdaptSGDAdapter(optimizer)
-        elif class_name == "DAdaptAdaGrad":
-            adapter = DAdaptAdaGradAdapter(optimizer)
-    elif module.startswith("transformers") and class_name == "Adafactor":
-        adapter = AdafactorAdapter(optimizer)
-    elif module.startswith("schedulefree"):
-        if class_name in ("AdamWScheduleFree", "RAdamScheduleFree"):
-            adapter = ScheduleFreeAdapter(
-                optimizer, {"z": POSITION, "exp_avg_sq": GRADIENT_SQUARED, "exp_avg": GRADIENT}
-            )
-        elif class_name == "SGDScheduleFree":
-            adapter = ScheduleFreeAdapter(optimizer, {"z": POSITION})
-    elif module.startswith("bitsandbytes"):
-        if "Adam" in class_name and "AdEMAMix" not in class_name:
-            adapter = BitsAndBytesAdapter(optimizer, GRADIENT, has_state2=True)
-        elif "Lion" in class_name:
-            adapter = BitsAndBytesAdapter(optimizer, GRADIENT, has_state2=False)
-        elif "SGD" in class_name:
-            adapter = BitsAndBytesAdapter(optimizer, VECTOR, has_state2=False)
+    elif module.startswith("bitsandbytes") and "Adam" in class_name and "AdEMAMix" not in class_name:
+        adapter = BitsAndBytesAdapter(optimizer, GRADIENT, has_state2=True)
 
     if adapter is None:
         raise ValueError(
-            "LoRA-Squeeze global optimizer mode is not implemented for "
-            f"{_qualified_name(optimizer)}. Its state will not be guessed; use "
-            "--lora_squeeze_optimizer_mode=per_squeeze."
+            "LoRA-Squeeze global optimizer mode supports only Adam-family optimizers "
+            "(Adam, AdamW, RAdam, NAdam, Adamax and the bitsandbytes Adam/AdamW variants), not "
+            f"{_qualified_name(optimizer)}. Use --lora_squeeze_optimizer_mode=per_squeeze."
         )
     adapter.preflight()
     return adapter

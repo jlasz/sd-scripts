@@ -26,7 +26,7 @@ The shared training utilities (formerly a single large `train_util.py`) are spli
 | `library/lora_squeeze_schedule.py` | LoRA-Squeeze schedules, progress budgets, validation, and resume serialization |
 | `library/lora_squeeze_network.py` | LoRA-Squeeze network-facing protocols and standard Linear/Conv2d factor validation/replacement |
 | `library/lora_squeeze_compression.py` | LoRA-Squeeze protocol/network validation, optimizer parameter-layout validation, and SVD compression |
-| `library/lora_squeeze_optimizer.py` | Optimizer-specific LoRA-Squeeze state transformations |
+| `library/lora_squeeze_optimizer.py` | LoRA-Squeeze global-mode state transfer (Adam-family optimizers only) |
 | `library/lora_squeeze_training.py` | LoRA-Squeeze runtime integration, training budgets, metadata/logging, optimizer/scheduler rebuilding, and Accelerate lifecycle |
 | `library/model_io.py` | Checkpoint loading (`load_target_model`), model hashes, safetensors metadata, SAI model spec |
 | `library/checkpoint_io.py` | Save / rotate checkpoints and train state (`save_sd_model_on_*`, filename templates) |
@@ -133,3 +133,8 @@ When adding support for new models, implement the four core strategies:
 - Use gradient checkpointing for large models
 - Implement block swapping for models with transformer architectures
 - Cache intermediate results (latents, text embeddings) when possible
+
+## Fork Conventions
+
+### Branch naming
+Do not name branches after datasets, characters, or training subjects (for example `rms-probe-priscilla-recalibration`). Name a branch after the code change it carries, such as `agent/rms-probe-recalibration` or `feature/lora-squeeze`.

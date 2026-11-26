@@ -154,21 +154,18 @@ The numerical rank is reported at every squeeze. If the target rank includes num
 `lora_squeeze_optimizer_mode` controls optimizer state across rank changes:
 
 - `per_squeeze` (default): rebuilds the optimizer with fresh state after each rank change. This is supported for every optimizer.
-- `global`: uses an optimizer-specific transfer policy. Gradient moments, parameter-space update buffers, parameter anchors, and optimizer-wide statistics are handled according to their different meanings. Unknown state is rejected before changing the network unless the optimizer has an explicitly documented coherent warm-restart policy below.
+- `global`: carries Adam-family optimizer state across rank changes. The first and second gradient moments are projected into the new rank coordinates. Unknown state is rejected before changing the network.
 
 Global mode currently requires every optimizer parameter to be a squeezeable `lora_down.weight` or `lora_up.weight` factor. Factors intentionally omitted through a zero learning rate are allowed. Additional trainable gates, biases, embeddings, or other parameters are rejected before training because their state cannot yet be continued safely across optimizer rebuilding. Factor group membership and ordering must also remain stable after every squeeze. `per_squeeze` mode intentionally resets state and does not have this restriction.
 
-Global mode currently supports:
+Global mode supports only Adam-family optimizers:
 
-- PyTorch Adam-family, SGD, Adagrad, RMSprop, Adamax, Adadelta, and ASGD optimizers, plus `lion-pytorch` Lion.
-- bitsandbytes AdamW, SGD, and Lion variants used by sd-scripts. Block-wise 8-bit state is dequantized, projected, and requantized; 32-bit and paged variants use the same policy. Other bitsandbytes algorithms are rejected.
-- Adafactor. Its factored second moment is reconstructed, projected, and factored again, while its relative-step counter is preserved.
-- `AdamWScheduleFree`, `RAdamScheduleFree`, and `SGDScheduleFree`. Their auxiliary parameter point and averaging/warmup progress are preserved.
-- Prodigy. With `slice_p=1`, moments, the accumulated `s` statistic, the `p0` anchor, learned `d`, and step progress are continued. A sliced `slice_p>1` state cannot be inverted after rank mixing, so it uses a coherent warm restart: learned `d`/`d_max` are kept while moments and the estimator history restart together.
-- ProdigyPlusScheduleFree. Its fixed sliced Prodigy statistics, schedule-free point, and optional factored state cannot be transformed jointly. Global mode therefore performs the same kind of coherent warm restart, preserving each parameter group's learned `d` while restarting all coupled per-parameter and averaging state together.
-- D-Adaptation Adam, AdaGrad, Adan, AdanIP, Lion, and SGD variants. Their learned `d` is preserved and their algorithm-specific state and estimator totals are transformed consistently.
+- PyTorch `Adam`, `AdamW` (including `amsgrad`), `RAdam`, `NAdam`, and `Adamax`.
+- bitsandbytes Adam/AdamW variants (`AdamW8bit`, `PagedAdamW8bit`, 32-bit versions, etc.). Block-wise 8-bit state is dequantized, projected, and requantized; paged variants stay paged.
 
-Projecting a diagonal second moment through a rank-coordinate change is necessarily an approximation because the optimizer does not store cross-coordinate covariance. First moments and parameter-space displacements use their corresponding covector/vector transformations.
+Any other optimizer (SGD, Lion, Adafactor, Prodigy, D-Adaptation, schedule-free, etc.) is rejected before training in global mode; use `per_squeeze` with those.
+
+Projecting a diagonal second moment through a rank-coordinate change is necessarily an approximation because the optimizer does not store cross-coordinate covariance. First moments are projected as covectors.
 
 In global mode, projected state is staged on CPU one module at a time. Once projection succeeds, the old optimizer state is moved to CPU and the replacement state is moved back beside its new parameters. This avoids retaining complete old and new optimizer-state copies on the GPU at the same time; if rebuilding fails, the original state and LoRA layers are restored. If CPU staging or offload itself fails, the transition is rolled back and retried once with optimizer state kept on the parameter devices, at the cost of higher peak VRAM usage.
 
@@ -177,9 +174,9 @@ In global mode, projected state is staged on CPU one module at a time. Once proj
 - `global` (default): continues one LR scheduler curve over the full training run.
 - `per_squeeze`: restarts the LR scheduler for each rank stage using that stage's configured step budget.
 
-For example, `lora_squeeze_optimizer_mode = "per_squeeze"` with `lora_squeeze_scheduler_mode = "global"` resets AdamW moments at each squeeze while preserving progress through a cosine LR curve. Global optimizer-mode logs include projected, warm-restarted, reset, and empty optimizer-state counts.
+For example, `lora_squeeze_optimizer_mode = "per_squeeze"` with `lora_squeeze_scheduler_mode = "global"` resets AdamW moments at each squeeze while preserving progress through a cosine LR curve. Global optimizer-mode logs include projected, reset, and empty optimizer-state counts.
 
-Optimizers that own their learning-rate or averaging schedule cannot split these two lifecycles. Schedule-free optimizers, ProdigyPlusScheduleFree, and Adafactor with `relative_step=True` therefore require optimizer and scheduler mode to be equal: either both `global` or both `per_squeeze`. This is validated before training starts.
+Optimizers that own their learning-rate or averaging schedule cannot split these two lifecycles. Schedule-free optimizers, ProdigyPlusScheduleFree, and Adafactor with `relative_step=True` therefore require optimizer and scheduler mode to be equal. Because they are not supported by global optimizer mode, that means both must be `per_squeeze`. This is validated before training starts.
 
 <details>
 <summary>日本語</summary>
@@ -187,27 +184,24 @@ Optimizers that own their learning-rate or averaging schedule cannot split these
 `lora_squeeze_optimizer_mode`はランク変更前後のオプティマイザ状態を制御します。
 
 - `per_squeeze`（デフォルト）: ランク変更後に新しい状態でオプティマイザを再構築します。すべてのオプティマイザで使用できます。
-- `global`: オプティマイザ固有の変換方針で状態を引き継ぎます。勾配モーメント、パラメータ空間の更新バッファ、アンカー、オプティマイザ全体の統計は、それぞれの意味に応じて処理します。未知の状態はネットワークを変更する前に拒否します。ただし、下記の一貫したウォームリスタート方針が明記されている場合を除きます。
+- `global`: Adam系オプティマイザの状態をランク変更後も引き継ぎます。1次・2次の勾配モーメントを新しいランク座標へ射影します。未知の状態はネットワークを変更する前に拒否します。
 
 `global`では、すべてのオプティマイザパラメータが圧縮可能な`lora_down.weight`または`lora_up.weight`である必要があります。学習率0によって意図的に除外した因子は使用できますが、追加のgate、bias、embeddingなどの学習パラメータは未対応です。圧縮後も因子のパラメータグループ構成と順序が同じでなければなりません。`per_squeeze`は状態をリセットするため、この制約はありません。
 
-`global`で現在対応しているオプティマイザは次のとおりです。
+`global`はAdam系オプティマイザのみに対応しています。
 
-- PyTorchのAdam系、SGD、Adagrad、RMSprop、Adamax、Adadelta、ASGD、および`lion-pytorch`のLion。
-- sd-scriptsで使用するbitsandbytesのAdamW、SGD、Lion系。block-wise 8-bit状態は逆量子化、射影、再量子化され、32-bit版とpaged版も同じ方針を使用します。
-- Adafactor。factor化された2次モーメントを復元して射影し、再度factor化します。relative-stepのカウンタは維持します。
-- `AdamWScheduleFree`、`RAdamScheduleFree`、`SGDScheduleFree`。補助パラメータ点と平均化・ウォームアップの進行を維持します。
-- Prodigy。`slice_p=1`ではmoments、累積`s`、`p0`アンカー、学習済み`d`、stepを引き継ぎます。`slice_p>1`はランク混合後に逆変換できないため、`d`と`d_max`を維持し、momentsと推定履歴をまとめて再開します。
-- ProdigyPlusScheduleFree。学習済み`d`を維持し、結合されたパラメータ別状態と平均化状態を一貫して再開します。
-- D-AdaptationのAdam、AdaGrad、Adan、AdanIP、Lion、SGD系。学習済み`d`を維持し、アルゴリズム固有の状態と推定値の合計を整合するよう変換します。
+- PyTorchの`Adam`、`AdamW`（`amsgrad`を含む）、`RAdam`、`NAdam`、`Adamax`。
+- bitsandbytesのAdam/AdamW系（`AdamW8bit`、`PagedAdamW8bit`、32-bit版など）。block-wise 8-bit状態は逆量子化、射影、再量子化され、paged版はpagedのまま維持されます。
 
-対角2次モーメントの射影は、オプティマイザが座標間の共分散を保持しないため近似になります。1次モーメントとパラメータ空間の変位には、それぞれ共変ベクトルとベクトルに対応する変換を使用します。
+それ以外のオプティマイザ（SGD、Lion、Adafactor、Prodigy、D-Adaptation、schedule-free系など）は`global`では学習開始前に拒否されます。これらには`per_squeeze`を使用してください。
+
+対角2次モーメントの射影は、オプティマイザが座標間の共分散を保持しないため近似になります。1次モーメントは共変ベクトルとして射影します。
 
 `global`では射影した状態をモジュール単位でCPUへ一時配置します。射影成功後、古い状態をCPUへ移し、新しい状態を新しいパラメータと同じデバイスへ戻します。これにより古い状態と新しい状態の完全なコピーが同時にGPUへ存在することを避けます。再構築に失敗した場合は元の状態とLoRA層を復元します。CPUへの一時配置またはoffloadに失敗した場合も変更を取り消し、ピークVRAMの増加を許容してパラメータのデバイス上で1回だけ再試行します。
 
 `lora_squeeze_scheduler_mode`は外部LRスケジューラを独立に制御します。`global`（デフォルト）は学習全体で1つの曲線を継続し、`per_squeeze`は各ランク区間のステップ数で曲線を再開します。たとえばオプティマイザを`per_squeeze`、スケジューラを`global`にすると、AdamWのmomentsは圧縮ごとにリセットされますがcosine LR曲線は継続します。
 
-学習率または平均化スケジュールをオプティマイザ自身が持つ場合、この2つのライフサイクルは分離できません。そのためschedule-free系、ProdigyPlusScheduleFree、および`relative_step=True`のAdafactorでは、オプティマイザとスケジューラのmodeを両方`global`または両方`per_squeeze`にする必要があります。この条件は学習開始前に検証されます。
+学習率または平均化スケジュールをオプティマイザ自身が持つ場合、この2つのライフサイクルは分離できません。そのためschedule-free系、ProdigyPlusScheduleFree、および`relative_step=True`のAdafactorでは、オプティマイザとスケジューラのmodeを同じにする必要があります。これらは`global`に対応していないため、両方`per_squeeze`にしてください。この条件は学習開始前に検証されます。
 
 </details>
 

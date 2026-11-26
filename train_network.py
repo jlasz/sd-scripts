@@ -1838,9 +1838,7 @@ class NetworkTrainer:
 
         optimizer_name, optimizer_args, optimizer = optimizer_util.get_optimizer(args, trainable_params)
         optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
-        optimizer_state_adapter = lora_squeeze.preflight_optimizer(optimizer, network)
-        for message in lora_squeeze.optimizer_preflight_status_messages(optimizer_state_adapter):
-            accelerator.print(message)
+        lora_squeeze.preflight_optimizer(optimizer, network)
 
         # prepare dataloader
         # strategies are set here because they cannot be referenced in another process. Copy them with the dataset

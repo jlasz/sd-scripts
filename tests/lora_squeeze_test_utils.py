@@ -126,7 +126,7 @@ class FakeAccelerator:
 
 
 class FakeOptimizerUtil:
-    def __init__(self, optimizer_class=torch.optim.SGD, lr=0.1):
+    def __init__(self, optimizer_class=torch.optim.AdamW, lr=0.1):
         self.optimizer_class = optimizer_class
         self.lr = lr
         self.training_steps = []
@@ -150,7 +150,7 @@ def effective_delta(module):
 
 def build_controller(schedule, network, optimizer_util=None, args=None):
     args = args or SimpleNamespace()
-    raw_optimizer = torch.optim.SGD(network.parameters(), lr=0.1)
+    raw_optimizer = torch.optim.AdamW(network.parameters(), lr=0.1)
     optimizer = ReplaceableOptimizer(raw_optimizer)
     scheduler = ReplaceableLRScheduler(FakeScheduler(raw_optimizer))
     accelerator = FakeAccelerator(optimizer, scheduler)
@@ -163,7 +163,7 @@ def build_controller(schedule, network, optimizer_util=None, args=None):
         schedule=schedule,
         network=network,
         optimizer_util=optimizer_util,
-        optimizer_name="torch.optim.SGD",
+        optimizer_name="torch.optim.AdamW",
         optimizer_args="",
         optimizer=optimizer,
         optimizer_train_fn=lambda: None,

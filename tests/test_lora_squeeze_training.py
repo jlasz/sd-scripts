@@ -234,7 +234,9 @@ def test_cpu_staging_failure_retries_on_parameter_device(monkeypatch):
     network = FakeNetwork(FakeLoRAModule(7, 5, 4, schedule.current_alpha))
     controller, accelerator, _, optimizer, _, grad_refreshes = build_controller(schedule, network)
     for parameter in optimizer.param_groups[0]["params"]:
-        optimizer.state[parameter]["momentum_buffer"] = torch.ones_like(parameter)
+        optimizer.state[parameter]["step"] = torch.tensor(1.0)
+        optimizer.state[parameter]["exp_avg"] = torch.ones_like(parameter)
+        optimizer.state[parameter]["exp_avg_sq"] = torch.ones_like(parameter)
 
     staging_devices = []
 
@@ -268,7 +270,9 @@ def test_terminal_squeeze_skips_rebuild_without_resumable_state():
     network = FakeNetwork(FakeLoRAModule(7, 5, 4, schedule.current_alpha))
     controller, accelerator, optimizer_util, optimizer, scheduler, grad_refreshes = build_controller(schedule, network)
     for parameter in optimizer.param_groups[0]["params"]:
-        optimizer.state[parameter]["momentum_buffer"] = torch.ones_like(parameter)
+        optimizer.state[parameter]["step"] = torch.tensor(1.0)
+        optimizer.state[parameter]["exp_avg"] = torch.ones_like(parameter)
+        optimizer.state[parameter]["exp_avg_sq"] = torch.ones_like(parameter)
 
     assert controller.run_if_due(schedule.squeeze_steps[0])
 
